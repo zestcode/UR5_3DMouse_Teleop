@@ -1,0 +1,90 @@
+# General SpaceMouse teleop of the UR5 + RGB video of the D455 cameras with a pose per frame (recorder.py).
+# Started by teleop.sh. All nodes are in this directory.
+# From the shell (not set here: dora 0.3.8 lets a YAML value override the shell): ROBOT_IP, CAMERAS (teleop.local.env),
+# DRY_RUN, EPISODE_PLAN, OUT_DIR; MOCK_* tests only.
+nodes:
+  - id: spacemouse
+    path: spacemouse.py
+    inputs:
+      tick:
+        source: dora/timer/millis/10
+        queue_size: 1
+    outputs: [command, gripper]
+    env:
+      MOUSE_MAX: '250'
+      DEADZONE: '0.24'
+      GRIPPER_OPEN_BUTTON: '0'   # left: press = open, press again = stop
+      GRIPPER_CLOSE_BUTTON: '1'  # right: press = close until gripped/closed, press again = stop
+
+  - id: keyboard
+    path: keyboard.py  # Esc: home + stop; Ctrl-C: stop; Space; h
+    inputs:
+      tick:
+        source: dora/timer/millis/5
+        queue_size: 1
+    outputs: [esc, record, home]
+    env:
+      RECORD_KEY: '1'
+      HOME_KEY: '1'
+
+  - id: ur5
+    path: ur5.py
+    inputs:
+      command:
+        source: spacemouse/command
+        queue_size: 1
+      heartbeat:
+        source: recorder/heartbeat
+        queue_size: 1
+      esc:
+        source: keyboard/esc
+        queue_size: 4
+      home:
+        source: keyboard/home
+        queue_size: 4
+      gripper:
+        source: spacemouse/gripper
+        queue_size: 16
+    outputs: [state]
+    env:
+      CONTROL_HZ: '125'
+      MAX_LINEAR_M_S: '0.08'
+      MAX_ANGULAR_RAD_S: '0.2'
+      SERVO_LOOKAHEAD_S: '0.1'
+      SERVO_GAIN: '300'
+      LEASH_M: '0.03'
+      LEASH_RAD: '0.2'
+      STOP_ACCELERATION: '1.0'
+      COMMAND_TIMEOUT_S: '0.15'
+      RECORDER_TIMEOUT_S: '1.0'  # no recorder heartbeat (cameras not delivering) for 1 s -> target frozen
+      WATCHDOG_HZ: '5'
+      WORKSPACE_OFFSET_MIN: '[null, null, -0.05]'
+      WORKSPACE_OFFSET_MAX: '[null, null, 0.15]'
+      WORKSPACE_Z_MIN: '-0.0965'
+      BOUND_MARGIN_M: '0.02'
+      HOME_Q_DEG: '[0, -90, 90, -90, -88, 180]'
+      HOME_SPEED: '0.2'
+      HOME_ACCELERATION: '0.3'
+      HOME_DELAY_S: '3'
+      GRIPPER: '1'
+      GRIPPER_SPEED: '64'
+      GRIPPER_FORCE: '100'
+
+  - id: recorder
+    path: recorder.py
+    inputs:
+      tick:
+        source: dora/timer/millis/50
+        queue_size: 1
+      state:
+        source: ur5/state
+        queue_size: 1000       # never drop state samples
+      record:
+        source: keyboard/record
+        queue_size: 16
+    outputs: [heartbeat]
+    env:
+      COLOR_W: '640'
+      COLOR_H: '480'
+      FPS: '30'
+      MAX_POSE_GAP_MS: '50'

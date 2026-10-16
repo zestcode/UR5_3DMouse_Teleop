@@ -1,0 +1,378 @@
+"""Teleop recorder (Dora node): RGB video of each D455 + the robot pose for every video frame.
+
+Cameras: color only (COLOR_W x COLOR_H bgr8 @ FPS), one rs.pipeline per camera, streaming for the whole run.
+Space (`record` input) starts / stops an episode. The robot (`state` input, every ur5/state record) is kept for the
+whole session in <session>/robot.jsonl (unchanged JSON lines, raw evidence).
+
+OUT_DIR/<session>/
+  session.json                    cameras (serial, color intrinsics), settings, episodes
+  robot.jsonl                     every ur5/state record of the session (t_ns = host CLOCK_MONOTONIC)
+  <NNN>_<label>/episode.json      start / end, per camera frame count + frame-number gaps
+  <NNN>_<label>/<role>.mp4        RGB video (mp4v), frame i = row i of <role>_frames.csv
+  <NNN>_<label>/<role>_frames.csv per frame: SDK frame number, timestamp + domain, host receive time, the frame
+                                  time on the host monotonic clock, and the TCP / flange pose at that time
+Frame time: SDK global_time (host system clock, ms) -> monotonic via (time_ns - monotonic_ns) read at receive.
+Pose at frame time: linear (xyz) + slerp (rotation) between the two bracketing robot records; pose_valid=0 when
+the frame lies outside the robot records or the bracket is wider than MAX_POSE_GAP_MS.
+Poses: base frame, metres, quaternion x y z w (from the ur5 node's rot6d = first two rows of R).
+Env: CAMERAS (role:serial,...), COLOR_W/COLOR_H/FPS, OUT_DIR, EPISODE_PLAN (labels, one per line), MAX_POSE_GAP_MS,
+MOCK_CAMERA=1 (synthetic frames, tests), START_RECORDING=1 (first episode starts by itself, tests)."""
+import csv
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import threading
+import time
+import uuid
+
+import numpy as np
+import pyarrow as pa
+
+ROWS = ["index", "frame_number", "timestamp_ms", "timestamp_domain", "host_receive_mono_ns", "frame_mono_ns",
+        "pose_valid", "pose_gap_ms", "tcp_x", "tcp_y", "tcp_z", "tcp_qx", "tcp_qy", "tcp_qz", "tcp_qw",
+        "flange_x", "flange_y", "flange_z", "flange_qx", "flange_qy", "flange_qz", "flange_qw"]
+
+
+def rot6d_to_mat(d6):
+    """rot6d = first two ROWS of R (ur5 node / UMI convention); Gram-Schmidt."""
+    d6 = np.asarray(d6, dtype=float)
+    b1 = d6[..., :3] / np.linalg.norm(d6[..., :3], axis=-1, keepdims=True)
+    b2 = d6[..., 3:] - np.sum(b1 * d6[..., 3:], axis=-1, keepdims=True) * b1
+    b2 = b2 / np.linalg.norm(b2, axis=-1, keepdims=True)
+    return np.stack((b1, b2, np.cross(b1, b2)), axis=-2)
+
+
+def mat_to_quat(R):
+    """(..., 3, 3) -> (..., 4) quaternion x y z w, w >= 0."""
+    R = np.asarray(R, dtype=float)
+    out = np.empty(R.shape[:-2] + (4,))
+    for i in np.ndindex(R.shape[:-2]):
+        m = R[i]
+        t = np.trace(m)
+        if t > 0:
+            s = 2 * np.sqrt(1 + t)
+            q = [(m[2, 1] - m[1, 2]) / s, (m[0, 2] - m[2, 0]) / s, (m[1, 0] - m[0, 1]) / s, s / 4]
+        else:
+            k = int(np.argmax(np.diag(m)))
+            a, b = (k + 1) % 3, (k + 2) % 3
+            s = 2 * np.sqrt(1 + m[k, k] - m[a, a] - m[b, b])
+            q = [0.] * 4
+            q[k], q[a], q[b], q[3] = s / 4, (m[a, k] + m[k, a]) / s, (m[b, k] + m[k, b]) / s, (m[b, a] - m[a, b]) / s
+        q = np.array(q)
+        out[i] = q * (1 if q[3] >= 0 else -1)
+    return out
+
+
+def slerp(q0, q1, u):
+    """Row-wise slerp of unit quaternions (x y z w), u in [0, 1]."""
+    dot = np.sum(q0 * q1, axis=-1, keepdims=True)
+    q1 = np.where(dot < 0, -q1, q1)
+    dot = np.abs(dot).clip(-1, 1)
+    theta = np.arccos(dot)
+    small = theta < 1e-6
+    s = np.where(small, 1., np.sin(theta))
+    w0 = np.where(small, 1 - u, np.sin((1 - u) * theta) / s)
+    w1 = np.where(small, u, np.sin(u * theta) / s)
+    q = w0 * q0 + w1 * q1
+    return q / np.linalg.norm(q, axis=-1, keepdims=True)
+
+
+def interpolate(t_robot, poses9d, t_query, max_gap_ns):
+    """-> (valid, gap_ms, xyz (N,3), quat (N,4)); poses9d (M,9) = xyz + rot6d at sorted t_robot (M,)."""
+    t_query = np.asarray(t_query, dtype=np.int64)
+    n = len(t_query)
+    xyz, quat = np.full((n, 3), np.nan), np.full((n, 4), np.nan)
+    gap = np.full(n, np.nan)
+    if len(t_robot) < 2 or n == 0:
+        return np.zeros(n, bool), gap, xyz, quat
+    j = np.searchsorted(t_robot, t_query, side="right")
+    inside = (j > 0) & (j < len(t_robot))
+    j0, j1 = (j - 1).clip(0, len(t_robot) - 2), j.clip(1, len(t_robot) - 1)
+    span = (t_robot[j1] - t_robot[j0]).astype(float)
+    gap[inside] = span[inside] / 1e6
+    valid = inside & (span <= max_gap_ns) & (span > 0)
+    if valid.any():
+        a, b = j0[valid], j1[valid]
+        u = ((t_query[valid] - t_robot[a]) / span[valid])[:, None]
+        p = np.asarray(poses9d, dtype=float)
+        xyz[valid] = (1 - u) * p[a, :3] + u * p[b, :3]
+        quat[valid] = slerp(mat_to_quat(rot6d_to_mat(p[a, 3:])), mat_to_quat(rot6d_to_mat(p[b, 3:])), u)
+    return valid, gap, xyz, quat
+
+
+def safe_label(text):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("_.") or "episode"
+
+
+def read_plan(path):
+    if not path:
+        return []
+    lines = (line.split("#", 1)[0].strip() for line in Path(path).read_text().splitlines())
+    return [safe_label(line) for line in lines if line]
+
+
+class Console:
+    """Operator messages straight to the terminal (teleop.sh sends dora's output to a log file)."""
+
+    def __init__(self):
+        try:
+            self.out, self.tty = open("/dev/tty", "w"), True
+        except OSError:
+            self.out, self.tty = sys.stdout, False
+        self.lock = threading.Lock()
+
+    def say(self, text):
+        with self.lock:
+            self.out.write(("\r\033[K" if self.tty else "") + text + "\n")
+            self.out.flush()
+        if self.tty:
+            print(text, flush=True)  # also in the node log
+
+    def status(self, text):
+        if self.tty:
+            with self.lock:
+                self.out.write("\r\033[K" + text)
+                self.out.flush()
+
+
+class Episode:
+    """One episode directory; add() runs in the camera threads (one role per thread), close() in the node loop."""
+
+    def __init__(self, session, index, label, cameras, size, fps):
+        import cv2
+        self.name = f"{index:03d}_{label}"
+        self.path = session / self.name
+        self.path.mkdir(parents=False, exist_ok=False)
+        self.video = {c.role: cv2.VideoWriter(str(self.path / f"{c.role}.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
+                                              fps, size) for c in cameras}
+        for role, writer in self.video.items():
+            if not writer.isOpened():
+                raise RuntimeError(f"cannot open video writer for {role}")
+        self.rows = {c.role: [] for c in cameras}
+        self.info = {"name": self.name, "label": label, "index": index, "start_host_mono_ns": time.monotonic_ns(),
+                     "start_host_unix_ns": time.time_ns(), "completed": False}
+        self.write_info()
+
+    def write_info(self):
+        (self.path / "episode.json").write_text(json.dumps(self.info, indent=1, allow_nan=False))
+
+    def add(self, role, image, row):
+        self.video[role].write(image)
+        row["index"] = len(self.rows[role])
+        self.rows[role].append(row)
+
+    def close(self, reason, robot_t, robot_tcp, robot_flange, max_gap_ns):
+        for writer in self.video.values():
+            writer.release()
+        self.info.update(end_host_mono_ns=time.monotonic_ns(), end_host_unix_ns=time.time_ns(), end_reason=reason,
+                         completed=True, cameras={})
+        for role, rows in self.rows.items():
+            t = np.array([r["frame_mono_ns"] for r in rows], dtype=np.int64)
+            ok, gap, tcp_xyz, tcp_q = interpolate(robot_t, robot_tcp, t, max_gap_ns)
+            _, _, fl_xyz, fl_q = interpolate(robot_t, robot_flange, t, max_gap_ns)
+            numbers = [r["frame_number"] for r in rows]
+            with (self.path / f"{role}_frames.csv").open("w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(ROWS)
+                for k, r in enumerate(rows):
+                    w.writerow([r["index"], r["frame_number"], f"{r['timestamp_ms']:.3f}", r["timestamp_domain"],
+                                r["host_receive_mono_ns"], r["frame_mono_ns"], int(ok[k]),
+                                "" if np.isnan(gap[k]) else f"{gap[k]:.3f}",
+                                *("" if np.isnan(v) else f"{v:.7f}" for v in (*tcp_xyz[k], *tcp_q[k], *fl_xyz[k], *fl_q[k]))])
+            self.info["cameras"][role] = {
+                "frames": len(rows), "frames_with_pose": int(ok.sum()),
+                "frame_number_gaps": int(sum(b - a - 1 for a, b in zip(numbers, numbers[1:]) if b - a > 1)),
+                "fps": (len(rows) - 1) / max((t[-1] - t[0]) / 1e9, 1e-9) if len(rows) > 1 else 0.}
+        self.write_info()
+        return self.info
+
+
+class Camera:
+    """One D455, color stream only, read in its own thread for the whole run."""
+
+    def __init__(self, role, serial, size, fps, mock=False):
+        self.role, self.serial, self.size, self.fps, self.mock = role, serial, size, fps, mock
+        self.lock, self.episode, self.last_ns, self.error = threading.Lock(), None, 0, None
+        self.running, self.intrinsics = True, None
+        if not mock:
+            import pyrealsense2 as rs
+            self.pipe, config = rs.pipeline(), rs.config()
+            config.enable_device(serial)
+            config.enable_stream(rs.stream.color, size[0], size[1], rs.format.bgr8, fps)
+            profile = self.pipe.start(config).get_stream(rs.stream.color).as_video_stream_profile()
+            i = profile.get_intrinsics()
+            self.intrinsics = {"width": i.width, "height": i.height, "fx": i.fx, "fy": i.fy, "ppx": i.ppx,
+                               "ppy": i.ppy, "model": str(i.model), "coeffs": list(i.coeffs), "source": "SDK"}
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+        self.thread.start()
+
+    def frames(self):
+        if self.mock:
+            n = 0
+            while self.running:
+                time.sleep(1 / self.fps)
+                n += 1
+                image = np.full((self.size[1], self.size[0], 3), n % 256, np.uint8)
+                yield image, n, time.time_ns() / 1e6, "mock"
+        else:
+            while self.running:
+                f = self.pipe.wait_for_frames(2000).get_color_frame()
+                yield (np.asanyarray(f.get_data()), f.get_frame_number(), f.get_timestamp(),
+                       str(f.get_frame_timestamp_domain()).split(".")[-1])
+
+    def loop(self):
+        try:
+            for image, number, stamp_ms, domain in self.frames():
+                mono, unix = time.monotonic_ns(), time.time_ns()
+                self.last_ns = mono
+                frame_mono = int(round(stamp_ms * 1e6)) - (unix - mono) if domain in ("global_time", "mock") else mono
+                with self.lock:
+                    if self.episode is not None:
+                        self.episode.add(self.role, image, {
+                            "frame_number": int(number), "timestamp_ms": float(stamp_ms), "timestamp_domain": domain,
+                            "host_receive_mono_ns": mono, "frame_mono_ns": frame_mono})
+        except Exception as exc:  # reported by the node loop; the heartbeat stops, so the arm freezes
+            self.error = exc
+
+    def stop(self):
+        self.running = False
+        self.thread.join(timeout=3)
+        if not self.mock:
+            self.pipe.stop()
+
+
+def main():
+    from dora import Node
+    here = Path(__file__).resolve().parent
+    mock = os.getenv("MOCK_CAMERA", "0") == "1"
+    size = (int(os.getenv("COLOR_W", "640")), int(os.getenv("COLOR_H", "480")))
+    fps = int(os.getenv("FPS", "30"))
+    max_gap_ns = float(os.getenv("MAX_POSE_GAP_MS", "50")) * 1e6
+    plan = read_plan(os.getenv("EPISODE_PLAN", ""))
+    cameras = os.getenv("CAMERAS", "") or ("wrist:mock,fixed:mock" if mock else "")  # role:serial,... (teleop.local.env)
+    if not cameras or "<" in cameras:
+        raise ValueError("CAMERAS not configured: set it in teleop.local.env (copy teleop.local.env.example)")
+    roles = [item.split(":") for item in cameras.split(",")]
+    root = Path(os.getenv("OUT_DIR", "data"))  # relative: next to this file
+    root = root if root.is_absolute() else here / root
+    session = root / (time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8] + ("_mock" if mock else ""))
+    session.mkdir(parents=True, exist_ok=False)
+    console = Console()
+    node = Node()
+    cams = [Camera(role, serial, size, fps, mock) for role, serial in roles]
+    meta = {"schema": "ur5-teleop-rgb-pose-v1", "simulated_camera": mock, "start_host_mono_ns": time.monotonic_ns(),
+            "start_host_unix_ns": time.time_ns(), "color": {"width": size[0], "height": size[1], "fps": fps,
+                                                            "format": "bgr8", "video": "mp4v"},
+            "cameras": {c.role: {"serial": c.serial, "color_intrinsics": c.intrinsics} for c in cams},
+            "max_pose_gap_ms": max_gap_ns / 1e6, "episode_plan": plan, "episodes": [],
+            "timing": "frame_mono_ns = SDK global_time (host system clock) mapped to CLOCK_MONOTONIC at receive; "
+                      "robot t_ns = CLOCK_MONOTONIC; pose = interpolation of robot.jsonl at frame_mono_ns",
+            "env": {k: os.environ[k] for k in ("CAMERAS", "COLOR_W", "COLOR_H", "FPS", "OUT_DIR", "EPISODE_PLAN",
+                                                "DRY_RUN", "MOCK_CAMERA", "MOCK_MOUSE") if k in os.environ}}
+
+    def save_meta():
+        (session / "session.json").write_text(json.dumps(meta, indent=1, allow_nan=False))
+    save_meta()
+    robot_t, robot_tcp, robot_flange = [], [], []
+    episode, count, end_reason, last_status = None, 0, "stopped", 0
+
+    def label(i):
+        return plan[i] if i < len(plan) else "episode"
+
+    def start():
+        nonlocal episode
+        episode = Episode(session, count + 1, label(count), cams, size, fps)
+        for c in cams:
+            with c.lock:
+                c.episode = episode
+        meta["episodes"].append(episode.name)
+        save_meta()
+        console.say(f"● Recording {episode.name}")
+
+    def stop():
+        """Detach the episode from the cameras; it is closed 0.2 s later (pending), once the robot records that
+        bracket its last frames have arrived."""
+        nonlocal episode, count
+        for c in cams:
+            with c.lock:
+                c.episode = None
+        done, episode, count = episode, None, count + 1
+        return done
+
+    def finish(done, reason):
+        info = done.close(reason, np.array(robot_t, dtype=np.int64), np.array(robot_tcp), np.array(robot_flange),
+                          max_gap_ns)
+        secs = (info["end_host_mono_ns"] - info["start_host_mono_ns"]) / 1e9
+        parts = [f"{r} {c['frames']} frames ({c['frames_with_pose']} with pose, {c['frame_number_gaps']} dropped)"
+                 for r, c in info["cameras"].items()]
+        console.say(f"✓ {done.name} saved ({secs:.0f} s): " + ", ".join(parts))
+
+    pending = []  # (episode, reason, close at monotonic ns): wait for the robot records after the last frame
+    console.say("Cameras started. Space = start / stop recording; h = home; Esc = home and quit.")
+    if os.getenv("START_RECORDING", "0") == "1":
+        start()
+    with (session / "robot.jsonl").open("w", buffering=1) as robot_log:
+        try:
+            for event in node:
+                if event["type"] == "STOP":
+                    break
+                if event["type"] != "INPUT":
+                    continue
+                now = time.monotonic_ns()
+                if event["id"] == "state":
+                    text = event["value"][0].as_py()
+                    robot_log.write(text + "\n")
+                    r = json.loads(text)
+                    robot_t.append(r["t_ns"])
+                    robot_tcp.append(r["tcp_pose"])
+                    robot_flange.append(r["flange_pose"])
+                elif event["id"] == "record":
+                    if episode is not None:
+                        pending.append((stop(), "stopped", now + 2e8))
+                    else:
+                        start()
+                elif event["id"] == "tick":
+                    for c in cams:
+                        if c.error is not None:
+                            raise RuntimeError(f"{c.role} camera: {c.error}")
+                    alive = all(now - c.last_ns < 5e8 for c in cams)
+                    if not robot_t and now - meta["start_host_mono_ns"] > 60e9:  # homing (countdown + moveJ) < 60 s
+                        raise RuntimeError("No robot state within 60 s: the ur5 node is not running (see the ur5 errors in the log)")
+                    if alive:
+                        node.send_output("heartbeat", pa.array([json.dumps({"t_ns": now})]))
+                    while pending and pending[0][2] <= now:
+                        done, reason, _ = pending.pop(0)
+                        finish(done, reason)
+                        if not plan or count < len(plan):
+                            console.say(f"  Next: {count + 1:03d}_{label(count)}  press Space to start")
+                    if now - last_status >= 1e9:
+                        last_status = now
+                        stale = [c.role for c in cams if now - c.last_ns >= 5e8]
+                        robot = ("waiting for the robot to reach home ..." if not robot_t else
+                                 "robot state stopped (ur5 node exited? see the log)" if now - robot_t[-1] > 5e8 else "")
+                        warn = "; ".join(filter(None, [f"{'/'.join(stale)} camera not delivering frames, robot locked" if stale else "", robot]))
+                        if episode is not None:
+                            s = (now - episode.info["start_host_mono_ns"]) / 1e9
+                            console.status(f"● Recording {episode.name}  {int(s // 60):02d}:{int(s % 60):02d}"
+                                           + (f"  ⚠ {warn}" if warn else ""))
+                        else:
+                            console.status(f"⚠ {warn}" if warn else "Ready: press Space to start recording")
+        except BaseException:
+            end_reason = "error"
+            raise
+        finally:
+            if episode is not None:
+                pending.append((stop(), end_reason, 0))
+            for done, reason, _ in pending:
+                finish(done, reason)
+            for c in cams:
+                c.stop()
+            meta["end_host_mono_ns"] = time.monotonic_ns()
+            save_meta()
+            console.say(f"Exited. Recorded {len(meta['episodes'])} episode(s) this run, data in {session}")
+
+
+if __name__ == "__main__":
+    main()
