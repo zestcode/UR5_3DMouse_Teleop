@@ -1,59 +1,66 @@
-# teleop — UR5 SpaceMouse 遥操 + RGB 视频 + 每帧位姿
+# teleop - UR5 SpaceMouse teleoperation + RGB video + per-frame pose
 
-独立工具包：SpaceMouse 遥操 UR5（Robotiq 夹爪），录每台 RealSense D455 的 RGB 视频，并给每一帧配上机器人位姿。
-只录 RGB（color 流），不开 IR / depth，没有相机预热。所有路径都相对本目录，可整个目录拷到其他机器使用。
+Self-contained tool: teleoperate a UR5 (Robotiq gripper) with a SpaceMouse, record the RGB video of each RealSense
+D455, and attach the robot pose to every video frame. RGB (color stream) only: no IR, no depth, no camera warm-up.
+All paths are relative to this directory, so the whole directory can be copied to another machine.
 
-## 新机器部署
+## Setup on a new machine
 
 ```bash
 git clone <repo> teleop && cd teleop
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # Python 3.12 测试过
-cp teleop.local.env.example teleop.local.env                          # 填 ROBOT_IP、CAMERAS、TELEOP_VENV
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # tested with Python 3.12
+cp teleop.local.env.example teleop.local.env                          # fill in ROBOT_IP, CAMERAS, TELEOP_VENV
 ```
 
-- `teleop.local.env`（不提交）：机器人 IP、相机 `角色:序列号`（`rs-enumerate-devices -s` 可查）、Python 环境路径。
-  没填或还是占位值时，预检直接报 “not configured”，不会连接任何设备。
-- 系统依赖：`spacenavd`（SpaceMouse 守护进程，需在运行）、librealsense 的 udev 规则、UR5 上装好 Robotiq URCap 并在示教器上 Activate。
-- 机械臂相关参数（home 关节角、工作空间 z 下限、速度上限、夹爪速度/力）在 `dataflow.yml` 的 `ur5` 节点里，
-  是按当前这台机器标定的；换一台机械臂或改了安装，先改这里。
+- `teleop.local.env` (not committed): robot IP, cameras as `role:serial` (list serials with `rs-enumerate-devices -s`),
+  and the Python environment path. If a value is missing or still a placeholder, the preflight stops with
+  "not configured" and connects to nothing.
+- System dependencies: `spacenavd` (SpaceMouse daemon, must be running), the librealsense udev rules, and the
+  Robotiq URCap installed on the UR5 and activated on the teach pendant.
+- Arm-specific parameters (home joint angles, workspace z floor, speed limits, gripper speed / force) are in the
+  `ur5` node of `dataflow.yml` and were set for the current robot; change them first for another arm or mounting.
 
-## 用法
+## Usage
 
 ```bash
-./teleop.sh                     # episode 命名 001_episode, 002_episode …
-./teleop.sh labels.txt          # 每行一个标签（# 起注释）给 episode 命名
-DRY_RUN=1 ./teleop.sh           # 不连机器人
-OUT_DIR=/某目录 ./teleop.sh     # 数据位置，默认本目录下 data/
+./teleop.sh                     # episodes are named 001_episode, 002_episode, ...
+./teleop.sh labels.txt          # one label per line ('#' starts a comment) names the episodes
+DRY_RUN=1 ./teleop.sh           # do not connect to the robot
+OUT_DIR=/some/dir ./teleop.sh   # data location, default data/ in this directory
 ```
 
-按键：Space 开始/停止 episode · h 回 home · Esc 回 home 并退出 · Ctrl-C 直接退出 · 鼠标左键夹爪开 / 右键夹爪合（再按一次停）。
-启动顺序：预检（机器人、夹爪、相机）→ 3 s 后自动回 home → 状态行显示就绪后可操作。相机不出帧时机器人锁定。
-分辨率、帧率等在 `dataflow.yml` 的 `recorder` 节点里改。
+Keys: Space start / stop an episode; h return home; Esc return home and quit; Ctrl-C quit without homing;
+SpaceMouse left button opens / right button closes the gripper (press again to stop).
+Start-up: preflight (robot, gripper, cameras) -> the robot returns home after 3 s -> operate once the status line
+shows ready. The robot is locked while the cameras deliver no frames.
+Resolution and frame rate are set in the `recorder` node of `dataflow.yml`.
 
-## 输出
+## Output
 
 ```
-OUT_DIR/<日期_时间_id>/
-  session.json                 相机序列号 + SDK RGB 内参、设置、episode 列表
-  robot.jsonl                  整个运行期间每条 ur5/state（125 Hz，原样）
+OUT_DIR/<date_time_id>/
+  session.json                 camera serials + SDK RGB intrinsics, settings, list of episodes
+  robot.jsonl                  every ur5/state record of the run (125 Hz, unchanged)
   <NNN>_<label>/
-    episode.json               起止时间、每台相机帧数 / 有位姿帧数 / 丢帧数 / fps
-    <role>.mp4                 RGB 视频（mp4v），第 i 帧 = CSV 第 i 行
-    <role>_frames.csv          每帧：SDK 帧号、时间戳、主机时间、frame_mono_ns、pose_valid、
-                               tcp_x..tcp_qw、flange_x..flange_qw（基座系，米，四元数 x y z w）
+    episode.json               start / end time; per camera: frames, frames with pose, frame-number gaps, fps
+    <role>.mp4                 RGB video (mp4v); frame i = row i of the CSV
+    <role>_frames.csv          per frame: SDK frame number, timestamp, host time, frame_mono_ns, pose_valid,
+                               tcp_x..tcp_qw, flange_x..flange_qw (base frame, metres, quaternion x y z w)
 ```
 
-位姿对应：帧时间 = SDK global_time（主机系统时钟）换到 CLOCK_MONOTONIC；在前后两条机器人记录间插值（位置线性、
-旋转 slerp）；帧不在机器人记录范围内或前后间隔 > `MAX_POSE_GAP_MS`（50 ms）时 `pose_valid=0`、位姿为空。
-`data/`、`out/`（dora 节点日志）不提交。
+Pose per frame: frame time = SDK global_time (host system clock) mapped to CLOCK_MONOTONIC; the pose is
+interpolated between the two surrounding robot records (position linear, rotation slerp). If a frame lies outside
+the robot records or the two records are more than `MAX_POSE_GAP_MS` (50 ms) apart, `pose_valid=0` and the pose is
+empty. `data/` and `out/` (dora node logs) are not committed.
 
-## 测试（在本目录下，用装好依赖的 Python 环境）
+## Tests (run in this directory, with the Python environment that has the requirements installed)
 
 ```bash
-tests/smoke.sh                                          # SMOKE：工具能否启动并出现第一条提示
+tests/smoke.sh                                          # SMOKE: the tool starts and shows its first prompt
 python -m unittest tests.test_recorder tests.test_common tests.test_control \
     tests.test_keyboard tests.test_gripper tests.test_spacemouse   # UNIT
-python -m unittest tests.test_integration               # INTEGRATION：整条 dataflow（模拟鼠标/相机，DRY_RUN）
+python -m unittest tests.test_integration               # INTEGRATION: full dataflow (mock mouse / cameras, DRY_RUN)
 ```
 
-三类测试都不连机器人、不开真相机，不需要 `teleop.local.env` 里的设备信息。
+None of the tests connects to the robot or opens a real camera, and none needs the device settings in
+`teleop.local.env`.
