@@ -1,0 +1,73 @@
+{
+ "schema": "ur5-teleop-rgb-pose-v1",
+ "task": "put_both_blocks_inside_the_bowl",
+ "run": "20261019_162934",
+ "simulated_camera": false,
+ "start_host_mono_ns": 339812810746940,
+ "start_host_unix_ns": 1792441774374201529,
+ "color": {
+  "width": 640,
+  "height": 480,
+  "fps": 30,
+  "format": "bgr8",
+  "video": "mp4v"
+ },
+ "cameras": {
+  "wrist": {
+   "serial": "318122303605",
+   "color_intrinsics": {
+    "width": 640,
+    "height": 480,
+    "fx": 386.98846435546875,
+    "fy": 386.4533996582031,
+    "ppx": 325.9328918457031,
+    "ppy": 239.34304809570312,
+    "model": "distortion.inverse_brown_conrady",
+    "coeffs": [
+     -0.05519598722457886,
+     0.0634487122297287,
+     -0.0002102566504618153,
+     0.0004197676607873291,
+     -0.01993488520383835
+    ],
+    "source": "SDK"
+   }
+  },
+  "fixed": {
+   "serial": "105322250776",
+   "color_intrinsics": {
+    "width": 640,
+    "height": 480,
+    "fx": 382.5445251464844,
+    "fy": 382.1273193359375,
+    "ppx": 331.3490295410156,
+    "ppy": 247.11264038085938,
+    "model": "distortion.inverse_brown_conrady",
+    "coeffs": [
+     -0.0551859587430954,
+     0.06266344338655472,
+     0.0004856187151744962,
+     0.000865306006744504,
+     -0.0198470801115036
+    ],
+    "source": "SDK"
+   }
+  }
+ },
+ "max_pose_gap_ms": 50.0,
+ "episode_plan": [],
+ "episodes": [
+  "001_episode"
+ ],
+ "timing": "frame_mono_ns = SDK global_time (host system clock) mapped to CLOCK_MONOTONIC at receive; robot t_ns = CLOCK_MONOTONIC; pose = interpolation of robot.jsonl at frame_mono_ns",
+ "env": {
+  "TASK": "put_both_blocks_inside_the_bowl",
+  "CAMERAS": "wrist:318122303605,fixed:105322250776",
+  "COLOR_W": "640",
+  "COLOR_H": "480",
+  "FPS": "30",
+  "OUT_DIR": "/data/tools/teleop/data",
+  "EPISODE_PLAN": "",
+  "DRY_RUN": "0"
+ }
+}
