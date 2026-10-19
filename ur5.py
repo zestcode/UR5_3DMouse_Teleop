@@ -47,10 +47,11 @@ def next_tick(deadline, period, now):
     return now if deadline < now - period else deadline
 
 
-def stop_requested(node, seconds):
+def stop_requested(node, seconds, inputs=None):
     """Wait up to `seconds` for Dora STOP. Ctrl-C reaches nodes only as STOP (each node has
     its own process group), so blocking phases must poll for it. Other events are dropped,
-    including INPUT_CLOSED (the keyboard node exits right after sending Esc)."""
+    including INPUT_CLOSED (the keyboard node exits right after sending Esc); `inputs` (a set)
+    collects the ids of the dropped INPUT events, so an Esc during homing is not lost."""
     end = time.monotonic() + seconds
     while (remaining := end - time.monotonic()) > 0:
         event = node.next(timeout=min(remaining, 0.05))
@@ -60,18 +61,42 @@ def stop_requested(node, seconds):
             raise RuntimeError(str(event))
         if event["type"] == "STOP":
             return True
+        if inputs is not None and event["type"] == "INPUT":
+            inputs.add(event["id"])
     return False
 
 
-def move_home(node, control, receive, home, speed, acceleration, delay, watchdog=False):
+def open_gripper(node, control, gripper, watchdog, inputs=None, timeout=5.0):
+    """Open the gripper fully (episode start state) and wait until the firmware stops it: end of travel, or contact.
+    STOP aborts (-> False); a timeout only warns, the arm homes anyway. `watchdog`, `inputs`: see move_home."""
+    print("Opening the gripper", flush=True)
+    gripper.open()
+    deadline = time.monotonic() + timeout
+    while gripper.snapshot()["mode"] != "stopped":
+        if gripper.error is not None:
+            raise RuntimeError(f"Gripper failed: {gripper.error}")
+        if time.monotonic() > deadline:
+            print(f"WARNING: the gripper did not finish opening within {timeout:g} s; homing anyway", flush=True)
+            break
+        if watchdog:
+            checked(control.kickWatchdog(), "kickWatchdog")
+        if stop_requested(node, 0.02, inputs):
+            return False
+    return True
+
+
+def move_home(node, control, receive, home, speed, acceleration, delay, watchdog=False, inputs=None, gripper=None):
     """Asynchronous moveJ so STOP can abort it with stopJ. `watchdog`: kick the RTDE
-    watchdog while waiting (needed once setWatchdog is active, i.e. on Esc)."""
+    watchdog while waiting (needed once setWatchdog is active, i.e. on Esc). `inputs`: see stop_requested.
+    `gripper`: open it fully after the countdown, before the arm moves (startup / episode reset)."""
     q0 = np.array(receive.getActualQ())
     if not control.isJointsWithinSafetyLimits(home.tolist()):
         raise RuntimeError("HOME_Q_DEG is outside the joint safety limits")
     print(f"Homing in {delay:g} s (Ctrl-C aborts): q_deg {np.degrees(q0).round(2).tolist()} "
           f"-> {np.degrees(home).round(2).tolist()}", flush=True)
-    if stop_requested(node, delay):
+    if stop_requested(node, delay, inputs):
+        return False
+    if gripper is not None and not open_gripper(node, control, gripper, watchdog, inputs):
         return False
     deadline = time.monotonic() + 10 + 2 * np.abs(home - q0).max() / speed
     checked(control.moveJ(home.tolist(), speed, acceleration, True), "moveJ home")
@@ -84,7 +109,7 @@ def move_home(node, control, receive, home, speed, acceleration, delay, watchdog
                 raise RuntimeError("Homing did not reach HOME_Q_DEG in time")
             if watchdog:
                 checked(control.kickWatchdog(), "kickWatchdog")
-            if stop_requested(node, 0.02):
+            if stop_requested(node, 0.02, inputs):
                 control.stopJ(2.0)
                 return False
     except BaseException:
@@ -124,6 +149,7 @@ def main():
     control = receive = gripper = None
     command = None
     heartbeat = last_print = 0
+    recording = False  # from the recorder heartbeat: only while an episode is recorded does the SpaceMouse act
     servoing = False
     twist = np.zeros(6)  # smoothed twist integrated into the target
     pose = np.array([0., 0., .5, 0., 0., 0.])
@@ -148,8 +174,8 @@ def main():
             if len(tcp_offset) != 6 or not np.isfinite(tcp_offset).all():
                 raise RuntimeError(f"Invalid TCP offset from controller: {tcp_offset}")
             print(f"TCP offset (flange frame, m / rotvec): {np.round(tcp_offset, 5).tolist()}", flush=True)
-            if home is not None and not move_home(node, control, receive, home,
-                                                  home_speed, home_acceleration, home_delay):
+            if home is not None and not move_home(node, control, receive, home, home_speed, home_acceleration,
+                                                  home_delay, gripper=gripper):  # episode start state: open + home
                 return
             # Box around the TCP at home (or at start if no home is configured).
             pose = np.array(receive.getActualTCPPose())
@@ -158,11 +184,14 @@ def main():
             checked(control.setWatchdog(watchdog), "setWatchdog")  # after homing: moveJ does not kick it
             last_robot_time = receive.getTimestamp()
         elif home is not None:
+            if gripper is not None and not open_gripper(node, control, gripper, False):
+                return
             print(f"DRY homing skipped: would moveJ to q_deg {np.degrees(home).round(2).tolist()}", flush=True)
         T_target = pose_matrix(pose)  # integrate on the target, never on the measured pose (DP)
         print(f"servoL: {hz:g} Hz {'paced by controller packets' if real else 'local clock'}, lookahead {lookahead:g} s, "
               f"gain {gain:g}; leash {leash_m:g} m / {leash_rad:g} rad", flush=True)
         esc = go_home = False
+        reset_id = reset_done = 0  # recorder `reset` requests: the last one received / the last one completed
         tick = time.monotonic()
         while True:
             if real:
@@ -188,38 +217,56 @@ def main():
                     if event["id"] == "command":
                         command = read_json(event)
                     elif event["id"] == "heartbeat":
-                        heartbeat = read_json(event)["t_ns"]
+                        beat = read_json(event)
+                        heartbeat, recording = beat["t_ns"], bool(beat.get("recording", False))
                     elif event["id"] == "gripper" and gripper is not None:
                         button = read_json(event)["button"]
-                        gripper.press(button)  # commanded mode changes in this cycle
-                        gripper_events.append(button)
+                        if recording:  # like the arm: no SpaceMouse control outside an episode
+                            gripper.press(button)  # commanded mode changes in this cycle
+                            gripper_events.append(button)
+                        else:
+                            print(f"gripper {button} button ignored: not recording", flush=True)
                     elif event["id"] == "home":
-                        go_home = True
+                        go_home = "h"
+                    elif event["id"] == "reset":  # recorder, after saving an episode: start pose for the next one
+                        go_home, reset_id = "reset", read_json(event)["id"]
                     elif event["id"] == "esc":
                         esc = True
                         break
             if esc:
                 break
-            if go_home:  # h key: moveJ home, then teleop again
-                go_home = False
-                if real and home is not None:
+            if go_home:  # h key or recorder reset: moveJ home, then teleop again
+                reason, go_home = go_home, False
+                opener = gripper if reason == "reset" else None  # reset = episode start state: gripper open too
+                homed = real and home is not None
+                during = set()  # inputs that arrived while homing
+                if homed:
                     if servoing:
                         checked(control.servoStop(stop_acceleration), "servoStop")
                         servoing = False
-                    print("h: returning home", flush=True)
-                    if not move_home(node, control, receive, home, home_speed, home_acceleration, 0, watchdog=True):
+                    print(f"{reason}: returning home", flush=True)
+                    if not move_home(node, control, receive, home, home_speed, home_acceleration, 0, watchdog=True,
+                                     inputs=during, gripper=opener):
                         return
                     pose = np.array(receive.getActualTCPPose())
                     T_target, twist = pose_matrix(pose), np.zeros(6)
                     last_robot_time = receive.getTimestamp()
-                    continue
-                if home is not None:
-                    print(f"DRY h: would moveJ home to q_deg {np.degrees(home).round(2).tolist()}", flush=True)
+                elif home is not None:  # dry run
+                    if opener is not None and not open_gripper(node, control, opener, False, during):
+                        return
+                    print(f"DRY {reason}: would moveJ home to q_deg {np.degrees(home).round(2).tolist()}", flush=True)
+                reset_done = reset_id
+                if "esc" in during:  # e.g. Space then Esc to finish: Esc still means home and quit
+                    esc = True
+                    break
+                if homed:
+                    continue  # next controller packet first
             now = time.monotonic_ns()
             target = limited_twist(command, now, timeout, linear, angular)
             recorder_ok = 0 <= now - heartbeat <= recorder_timeout * 1e9
-            # Disabled, stale or no recorder: freeze the target at once. Deadzone release: ramp down via the filter.
-            hard_stop = not recorder_ok or not command_live(command, now, timeout)
+            # Disabled, stale or no recorder, or no episode being recorded: freeze the target at once.
+            # Deadzone release: ramp down via the filter.
+            hard_stop = not recorder_ok or not recording or not command_live(command, now, timeout)
             if hard_stop:
                 target[:] = 0
                 twist = np.zeros(6)
@@ -250,7 +297,8 @@ def main():
                 err_m, err_rad = pose_error(T_target, pose_matrix(pose))
                 status = (f"mouse={np.round(command['axes'] if command else [0.] * 6, 2).tolist()} "
                           f"enabled={bool(command and command['enabled'])} "
-                          f"recorder={'ok' if recorder_ok else 'STALE'} target={'FROZEN' if hard_stop else 'live'} "
+                          f"recorder={'ok' if recorder_ok else 'STALE'} recording={'yes' if recording else 'no'} "
+                          f"target={'FROZEN' if hard_stop else 'live'} "
                           f"twist={np.round(twist, 4).tolist()} "
                           f"target_err={err_m * 1e3:.1f}mm/{np.degrees(err_rad):.2f}deg")
                 if grip is not None:
@@ -271,7 +319,9 @@ def main():
                       "flange_pose": pose9d(flange_from_tcp(pose, tcp_offset)).tolist(),
                       "tcp_offset": pose9d(pose_matrix(tcp_offset)).tolist(), "q": joints, "tcp_speed": actual_speed,
                       "target_pose": pose9d(T_target).tolist(), "command_twist": twist.tolist(),
-                      "target_twist": target.tolist(), "hard_stop": bool(hard_stop), "gripper": grip, "simulated": not real,
+                      "target_twist": target.tolist(), "hard_stop": bool(hard_stop), "recording": recording,
+                      "gripper": grip, "simulated": not real,
+                      "reset_done": reset_done,  # id of the last recorder reset that has reached home
                       "robot_mode": receive.getRobotMode() if real else 7,
                       "safety_mode": receive.getSafetyMode() if real else 1})
         # Esc: leave servo mode, return home, then end the whole dataflow (Ctrl-C ends it without homing).

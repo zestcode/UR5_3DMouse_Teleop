@@ -63,6 +63,40 @@ class HomeTests(unittest.TestCase):
         node.next.side_effect = lambda **kw: next(closed, None)
         self.assertFalse(module.stop_requested(node, 0.05))
 
+    def test_inputs_dropped_while_homing_are_collected(self):
+        module, node = load_ur5(), MagicMock()
+        events = iter([{"type": "INPUT", "id": "esc"}, {"type": "INPUT_CLOSED", "id": "esc"},
+                       {"type": "INPUT", "id": "heartbeat"}])
+        node.next.side_effect = lambda **kw: next(events, None)
+        seen = set()
+        self.assertFalse(module.stop_requested(node, 0.05, seen))
+        self.assertEqual(seen, {"esc", "heartbeat"})
+
+    def test_open_gripper_waits_until_stopped_and_kicks_watchdog(self):
+        module, node = load_ur5(), MagicMock()
+        node.next.return_value = None
+        control, gripper = MagicMock(), MagicMock(error=None)
+        gripper.snapshot.side_effect = [{"mode": "opening"}] * 3 + [{"mode": "stopped"}]
+        with patch.object(module, "print", create=True):
+            self.assertTrue(module.open_gripper(node, control, gripper, True))
+        gripper.open.assert_called_once()
+        self.assertEqual(control.kickWatchdog.call_count, 3)  # once per wait while opening
+
+    def test_open_gripper_timeout_warns_and_stop_aborts(self):
+        module, node = load_ur5(), MagicMock()
+        node.next.return_value = None
+        gripper = MagicMock(error=None)
+        gripper.snapshot.return_value = {"mode": "opening"}  # never reports stopped
+        with patch.object(module, "print", create=True) as printed:
+            self.assertTrue(module.open_gripper(node, None, gripper, False, timeout=0.05))  # homes anyway
+        self.assertTrue(any("WARNING" in c.args[0] for c in printed.call_args_list))
+        node.next.return_value = {"type": "STOP"}
+        with patch.object(module, "print", create=True):
+            self.assertFalse(module.open_gripper(node, None, gripper, False))
+        gripper.error = "socket closed"
+        with self.assertRaisesRegex(RuntimeError, "Gripper failed"), patch.object(module, "print", create=True):
+            module.open_gripper(node, None, gripper, False)
+
     def test_stop_during_countdown_skips_motion(self):
         module, node = load_ur5(), MagicMock()
         node.next.return_value = {"type": "STOP"}
@@ -106,7 +140,8 @@ class PacketTests(unittest.TestCase):
 
 class ControlTests(unittest.TestCase):
     def run_control(self, fail_servo=False, auto_box=False, with_gripper=False, home=False, esc=False,
-                    release=False, start=(.5, .5, .5), hold=0, env_extra=None, expect_error=None, stamps=None):
+                    release=False, start=(.5, .5, .5), hold=0, env_extra=None, expect_error=None, stamps=None,
+                    reset=False, esc_while_homing=False, h_key=False, recording=True):
         control = MagicMock()
         receive = MagicMock()
         receive.getRobotMode.return_value = 7
@@ -124,13 +159,15 @@ class ControlTests(unittest.TestCase):
                     *[None] * 120] if release else []
         events = iter([
             {"type": "INPUT", "id": "command", "payload": {"t_ns": time.monotonic_ns(), "enabled": True, "axes": [1, 0, 0, 0, 0, 0]}},
-            {"type": "INPUT", "id": "heartbeat", "payload": {"t_ns": time.monotonic_ns()}},
+            {"type": "INPUT", "id": "heartbeat", "payload": {"t_ns": time.monotonic_ns(), "recording": recording}},
             {"type": "INPUT", "id": "gripper", "payload": {"t_ns": time.monotonic_ns(), "button": "close"}},
             None,
             *[None] * hold,  # keep pushing for `hold` more cycles
             *released,
             {"type": "INPUT", "id": "command", "payload": {"t_ns": time.monotonic_ns(), "enabled": False, "axes": [1, 0, 0, 0, 0, 0]}},
             None,
+            *([{"type": "INPUT", "id": "reset", "payload": {"id": 7}}, None, None] if reset else []),  # recorder
+            *([{"type": "INPUT", "id": "home"}, None, None] if h_key else []),  # h key
             {"type": "INPUT", "id": "esc"} if esc else {"type": "STOP"},
             {"type": "INPUT_CLOSED", "id": "esc"},  # keyboard node exits after Esc
         ])
@@ -144,13 +181,19 @@ class ControlTests(unittest.TestCase):
         env = {"DRY_RUN": "0", "ROBOT_IP": "fake", "WORKSPACE_MIN": "[0,0,0]", "WORKSPACE_MAX": "[1,1,1]",
                "GRIPPER": "1" if with_gripper else "0", "HOME_Q_DEG": str(HOME_DEG) if home else "",
                **(env_extra or {})}
+        self.order = []  # gripper open / arm moveJ, in call order
         if home:
             control.isJointsWithinSafetyLimits.return_value = True
-            control.moveJ.return_value = True
+            control.moveJ.side_effect = lambda *a: self.order.append("moveJ") or True
             receive.getActualQ.return_value = HOME
             receive.getActualQd.return_value = [0.] * 6
         gripper = MagicMock(error=None)
         gripper.snapshot.return_value = {"mode": "closing", "pos": 10, "obj": 0, "t_ns": 1}
+
+        def opened():  # the firmware reports fully open at once
+            self.order.append("open")
+            gripper.snapshot.return_value = {"mode": "stopped", "pos": 0, "obj": 3, "t_ns": 2}
+        gripper.open.side_effect = opened
         if auto_box:  # box from the start TCP read over RTDE
             env.update(WORKSPACE_MIN="", WORKSPACE_MAX="", WORKSPACE_OFFSET_MIN="", WORKSPACE_OFFSET_MAX="")
         printed = MagicMock()
@@ -159,7 +202,8 @@ class ControlTests(unittest.TestCase):
             with patch.object(module, "send_json") as sent, patch.object(module, "read_json", lambda e: e["payload"]), \
                     patch.object(module, "print", printed, create=True), \
                     patch.object(module, "Gripper", lambda *a, **k: gripper), \
-                    patch.object(module, "stop_requested", lambda node, seconds: False), \
+                    patch.object(module, "stop_requested", lambda node, seconds, inputs=None:
+                                 esc_while_homing and inputs is not None and inputs.add("esc")), \
                     patch.object(module.os, "kill") as kill:
                 if fail_servo or expect_error:
                     with self.assertRaisesRegex(RuntimeError, expect_error or "servoL failed"):
@@ -173,7 +217,9 @@ class ControlTests(unittest.TestCase):
         control.initPeriod.assert_not_called()
         control.waitPeriod.assert_not_called()
         self.servo_x = [c.args[0][0] for c in control.servoL.call_args_list]
-        if not expect_error:
+        if not expect_error and not recording:  # no episode recorded: the mouse push never moves the target
+            self.assertTrue(all(x == start[0] for x in self.servo_x))
+        elif not expect_error:
             tau = float((env_extra or {}).get("TWIST_FILTER_S", .15))
             first = .03 * (1 - math.exp(-(1 / 125) / tau))  # default MAX_LINEAR_M_S, low-passed one cycle
             edge = max(1 - .02, start[0])  # box [0, 1], margin .02; a start inside the margin is held, not snapped
@@ -185,10 +231,10 @@ class ControlTests(unittest.TestCase):
                 moving = steps[steps > 0]
                 self.assertGreater(len(moving), 10)
                 self.assertTrue(all(b < a for a, b in zip(moving, moving[1:])))  # increments shrink: ramp down
-            elif not fail_servo and not hold:
+            elif not fail_servo and not hold and not (reset or h_key):  # homing: the target restarts at home
                 self.assertTrue(all(x == self.servo_x[0] for x in self.servo_x))  # disabled -> target frozen
-        if control.servoL.called:
-            control.servoStop.assert_called_once_with(1.)  # STOP_ACCELERATION, only at shutdown
+        if control.servoL.called:  # STOP_ACCELERATION, only at shutdown (and before a reset moveJ)
+            self.assertEqual([c.args for c in control.servoStop.call_args_list], [(1.,)] * (2 if (reset or h_key) and not esc_while_homing else 1))
         control.stopScript.assert_called_once()
         control.disconnect.assert_called_once()
         receive.disconnect.assert_called_once()
@@ -207,6 +253,13 @@ class ControlTests(unittest.TestCase):
     def test_failed_motion_still_stops(self):
         self.run_control(fail_servo=True)
 
+    def test_not_recording_freezes_arm_and_ignores_gripper(self):
+        lines = self.run_control(with_gripper=True, recording=False)
+        self.gripper.press.assert_not_called()
+        self.assertIn("gripper close button ignored: not recording", lines)
+        self.assertTrue(all(s["hard_stop"] and s["recording"] is False for s in self.states))
+        self.assertTrue(all(s["gripper"]["events"] == [] for s in self.states))
+
     def test_gripper_action_in_same_state_record(self):
         self.run_control(with_gripper=True)
         self.gripper.start.assert_called_once()
@@ -219,12 +272,21 @@ class ControlTests(unittest.TestCase):
         self.assertIn("tcp_pose", first)
         self.assertEqual(self.states[1]["gripper"]["events"], [])
 
-    def test_startup_homing_then_watchdog_and_gripper_untouched(self):
+    def test_startup_opens_gripper_then_homes_then_watchdog(self):
         self.run_control(with_gripper=True, home=True)
+        self.assertEqual(self.order, ["open", "moveJ"])  # episode start state: gripper open, arm home
         calls = [c[0] for c in self.control.mock_calls]
         self.assertLess(calls.index("moveJ"), calls.index("setWatchdog"))  # moveJ does not kick the watchdog
-        # Homing must not open the gripper (it may be holding an object); only button presses do.
-        self.assertEqual([c.args[0] for c in self.gripper.press.call_args_list], ["close"])
+        self.assertEqual([c.args[0] for c in self.gripper.press.call_args_list], ["close"])  # the button press only
+
+    def test_recorder_reset_opens_gripper_then_returns_home(self):
+        self.run_control(with_gripper=True, home=True, reset=True)
+        self.assertEqual(self.order, ["open", "moveJ", "open", "moveJ"])  # startup, then the reset
+
+    def test_h_returns_home_without_touching_the_gripper(self):
+        lines = self.run_control(with_gripper=True, home=True, h_key=True)
+        self.assertIn("h: returning home", lines)
+        self.assertEqual(self.order, ["open", "moveJ", "moveJ"])  # startup open only: h may be carrying an object
 
     def test_esc_returns_home_then_stops_dataflow(self):
         self.run_control(home=True, esc=True)
@@ -233,6 +295,24 @@ class ControlTests(unittest.TestCase):
         last_move = len(calls) - 1 - calls[::-1].index("moveJ")
         self.assertLess(calls.index("servoStop"), last_move)  # leave servo mode before the Esc moveJ
         self.kill.assert_called_once_with(os.getppid(), signal.SIGINT)
+
+    def test_recorder_reset_returns_home_and_reports_done(self):
+        lines = self.run_control(home=True, reset=True)
+        self.assertEqual(self.control.moveJ.call_count, 2)  # startup homing + reset
+        self.assertIn("reset: returning home", lines)
+        calls = [c[0] for c in self.control.mock_calls]
+        last_move = len(calls) - 1 - calls[::-1].index("moveJ")
+        self.assertLess(calls.index("servoStop"), last_move)  # leave servo mode before the reset moveJ
+        done = [s["reset_done"] for s in self.states]
+        self.assertEqual((done[0], done[-1]), (0, 7))  # the recorder sees the reset id once home is reached
+        self.assertEqual(done, sorted(done))
+        self.kill.assert_not_called()  # teleop goes on
+
+    def test_esc_during_reset_homing_still_homes_and_quits(self):
+        self.run_control(home=True, reset=True, esc_while_homing=True)
+        self.assertEqual(self.control.moveJ.call_count, 3)  # startup + reset + Esc
+        self.kill.assert_called_once_with(os.getppid(), signal.SIGINT)
+        self.assertEqual(self.states[-1]["reset_done"], 0)  # quit right after homing: no state record any more
 
     def test_stop_exits_without_homing(self):
         self.run_control(home=True)

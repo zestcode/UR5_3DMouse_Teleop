@@ -1,5 +1,5 @@
 import unittest
-from keyboard import lone_esc
+from keyboard import delete_keys, lone_esc
 
 
 def feed(steps):
@@ -27,6 +27,20 @@ class EscTests(unittest.TestCase):
     def test_plain_keys_ignored_and_esc_after_them(self):
         self.assertIsNone(feed([(b"abc", 0.0), (b"", 0.3)]))
         self.assertEqual(feed([(b"q\x1b", 0.0), (b"", 0.2)]), 1)
+
+
+class DeleteKeyTests(unittest.TestCase):
+    def test_d_then_y_in_one_or_two_reads(self):
+        self.assertEqual(delete_keys(b"dy", False), (["ask", "yes"], False))
+        self.assertEqual(delete_keys(b"d", False), (["ask"], True))
+        self.assertEqual(delete_keys(b"Y", True), (["yes"], False))
+
+    def test_any_other_key_answers_no_once(self):
+        self.assertEqual(delete_keys(b" ", True), (["no"], False))
+        self.assertEqual(delete_keys(b"dny", False), (["ask", "no"], False))  # y after the answer: nothing
+
+    def test_y_without_d_and_plain_keys_send_nothing(self):
+        self.assertEqual(delete_keys(b"y h", False), ([], False))
 
 
 if __name__ == "__main__":

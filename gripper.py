@@ -103,11 +103,11 @@ class Gripper:
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
-    def press(self, button):
+    def press(self, button, toggle=True):
         """Toggle on a button press; returns the new commanded mode."""
         with self.lock:
             self.seq += 1
-            if self.mode == MOVING[button]:
+            if toggle and self.mode == MOVING[button]:
                 self.mode, command, target = "stopped", "SET GTO 0", None
             else:
                 target = TARGET[button]
@@ -115,6 +115,10 @@ class Gripper:
                 command = f"SET POS {target} SPE {self.speed} FOR {self.force} GTO 1"
             self.commands.put((self.seq, command, target))
             return self.mode
+
+    def open(self):
+        """Open fully, also when already opening (episode start state; a button press there would stop it)."""
+        return self.press("open", toggle=False)
 
     def poll(self):
         with self.lock:

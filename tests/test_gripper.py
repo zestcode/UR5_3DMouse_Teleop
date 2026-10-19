@@ -43,6 +43,16 @@ class GripperTests(unittest.TestCase):
         self.assertEqual((snap["pos"], snap["obj"]), (0, 3))  # fully open
         self.assertIsNone(g.error)
 
+    def test_open_never_toggles_to_stop(self):
+        g = self.make()
+        self.assertEqual(g.open(), "opening")
+        self.assertEqual(g.open(), "opening")  # a second open keeps opening; the open button would stop it
+        g.press("close")
+        self.assertEqual(g.open(), "opening")  # reverses a close
+        self.assertTrue(wait_for(lambda: g.snapshot()["mode"] == "stopped"))
+        self.assertEqual((g.snapshot()["pos"], g.snapshot()["obj"]), (0, 3))  # fully open
+        self.assertNotIn("SET GTO 0", self.fake.sent)
+
     def test_inactive_gripper_refused(self):
         fake = FakeRobotiq(verbose=False)
         fake.io = lambda command: "STA 0" if command == "GET STA" else "ack"

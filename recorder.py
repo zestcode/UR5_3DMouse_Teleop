@@ -1,31 +1,43 @@
 """Teleop recorder (Dora node): RGB video of each D455 + the robot pose for every video frame.
 
 Cameras: color only (COLOR_W x COLOR_H bgr8 @ FPS), one rs.pipeline per camera, streaming for the whole run.
-Space (`record` input) starts / stops an episode. The robot (`state` input, every ur5/state record) is kept for the
-whole session in <session>/robot.jsonl (unchanged JSON lines, raw evidence).
+Episodes are saved per task (TASK, chosen in teleop.sh / task.py) in OUT_DIR/<task>/, numbered from 001 within the
+task: the first episode of a run follows the task's highest-numbered episode (shown at start-up); episode NNN gets
+line NNN of EPISODE_PLAN as its label.
+Space (`record` input) starts / stops an episode; d then y (`delete` input) deletes the last episode of the task
+(also one of an earlier run), and the next episode takes its number and plan label again.
+The SpaceMouse moves the robot only while an episode is being recorded: the `heartbeat` output (sent while every
+camera delivers frames) carries `recording`, and the ur5 node freezes the arm and ignores the gripper buttons
+whenever it is false (before Space, while saving / resetting, after the last episode) or the heartbeat is stale.
+HOME_AFTER_EPISODE=1: once a stopped episode is saved, `reset` puts the robot back in the episode start state
+(gripper opened, then moveJ home); Space starts the next episode only after the ur5 state reports that reset done.
+The robot (`state` input, every ur5/state record) is kept for the whole run in robot.jsonl (unchanged JSON lines,
+raw evidence).
 
-OUT_DIR/<session>/
-  session.json                    cameras (serial, color intrinsics), settings, episodes
-  robot.jsonl                     every ur5/state record of the session (t_ns = host CLOCK_MONOTONIC)
-  <NNN>_<label>/episode.json      start / end, per camera frame count + frame-number gaps
+OUT_DIR/<task>/
+  <NNN>_<label>/episode.json      task, run, start / end, per camera frame count + frame-number gaps
   <NNN>_<label>/<role>.mp4        RGB video (mp4v), frame i = row i of <role>_frames.csv
   <NNN>_<label>/<role>_frames.csv per frame: SDK frame number, timestamp + domain, host receive time, the frame
                                   time on the host monotonic clock, and the TCP / flange pose at that time
+  _runs/<run>/session.json        one teleop run (<run> = its start, YYYYmmdd_HHMMSS): cameras (serial, color
+                                  intrinsics), settings, the episodes it recorded
+  _runs/<run>/robot.jsonl         every ur5/state record of the run (t_ns = host CLOCK_MONOTONIC)
 Frame time: SDK global_time (host system clock, ms) -> monotonic via (time_ns - monotonic_ns) read at receive.
 Pose at frame time: linear (xyz) + slerp (rotation) between the two bracketing robot records; pose_valid=0 when
 the frame lies outside the robot records or the bracket is wider than MAX_POSE_GAP_MS.
 Poses: base frame, metres, quaternion x y z w (from the ur5 node's rot6d = first two rows of R).
-Env: CAMERAS (role:serial,...), COLOR_W/COLOR_H/FPS, OUT_DIR, EPISODE_PLAN (labels, one per line), MAX_POSE_GAP_MS,
-MOCK_CAMERA=1 (synthetic frames, tests), START_RECORDING=1 (first episode starts by itself, tests)."""
+Env: TASK (task folder name), CAMERAS (role:serial,...), COLOR_W/COLOR_H/FPS, OUT_DIR, EPISODE_PLAN (labels, one
+per line), MAX_POSE_GAP_MS, MOCK_CAMERA=1 (synthetic frames, tests), START_RECORDING=1 (first episode starts by
+itself as soon as Space could start it, i.e. once the robot is ready; tests)."""
 import csv
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import threading
 import time
-import uuid
 
 import numpy as np
 import pyarrow as pa
@@ -113,6 +125,47 @@ def read_plan(path):
     return [safe_label(line) for line in lines if line]
 
 
+def last_episode(task):
+    """-> (number, path) of the highest-numbered episode directory <task>/<NNN>_<label> (of any run), or (0, None)."""
+    found = [(int(m.group(1)), p.name) for p in task.glob("*") if (m := re.match(r"(\d+)_", p.name)) and p.is_dir()]
+    number, name = max(found, default=(0, None))
+    return number, name and task / name
+
+
+def describe(path):
+    """'005_pick (54 s, saved)', from the episode.json of an episode directory."""
+    try:
+        info = json.loads((path / "episode.json").read_text())
+    except (OSError, ValueError):
+        info = {}
+    if info.get("completed"):
+        state = f"{(info['end_host_mono_ns'] - info['start_host_mono_ns']) / 1e9:.0f} s, saved" + (
+            ", ended by an error" if info.get("end_reason") == "error" else "")
+    else:
+        state = "INCOMPLETE: that run ended while it was recording; d then y deletes it"
+    return f"{path.name} ({state})"
+
+
+def run_meta_path(path):
+    """session.json of the run that recorded the episode directory `path` (from its episode.json; older layout
+    without a run: the session.json next to the episode)."""
+    try:
+        run = json.loads((path / "episode.json").read_text()).get("run")
+    except (OSError, ValueError):
+        run = None
+    return path.parent / "_runs" / run / "session.json" if run else path.parent / "session.json"
+
+
+def forget_episode(meta_path, name):
+    """Take a deleted episode out of the episode list in the session.json of its (earlier) run."""
+    try:
+        meta = json.loads(meta_path.read_text())
+        meta["episodes"].remove(name)
+    except (OSError, ValueError, KeyError):  # no / unreadable session.json, or the episode is not listed
+        return
+    meta_path.write_text(json.dumps(meta, indent=1, allow_nan=False))
+
+
 class Console:
     """Operator messages straight to the terminal (teleop.sh sends dora's output to a log file)."""
 
@@ -140,10 +193,10 @@ class Console:
 class Episode:
     """One episode directory; add() runs in the camera threads (one role per thread), close() in the node loop."""
 
-    def __init__(self, session, index, label, cameras, size, fps):
+    def __init__(self, task, index, label, cameras, size, fps, run=None):
         import cv2
         self.name = f"{index:03d}_{label}"
-        self.path = session / self.name
+        self.path = task / self.name
         self.path.mkdir(parents=False, exist_ok=False)
         self.video = {c.role: cv2.VideoWriter(str(self.path / f"{c.role}.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
                                               fps, size) for c in cameras}
@@ -151,7 +204,8 @@ class Episode:
             if not writer.isOpened():
                 raise RuntimeError(f"cannot open video writer for {role}")
         self.rows = {c.role: [] for c in cameras}
-        self.info = {"name": self.name, "label": label, "index": index, "start_host_mono_ns": time.monotonic_ns(),
+        self.info = {"name": self.name, "label": label, "index": index, "task": task.name, "run": run,
+                     "start_host_mono_ns": time.monotonic_ns(),
                      "start_host_unix_ns": time.time_ns(), "completed": False}
         self.write_info()
 
@@ -251,39 +305,53 @@ def main():
     fps = int(os.getenv("FPS", "30"))
     max_gap_ns = float(os.getenv("MAX_POSE_GAP_MS", "50")) * 1e6
     plan = read_plan(os.getenv("EPISODE_PLAN", ""))
+    home_after = os.getenv("HOME_AFTER_EPISODE", "0") == "1"
     cameras = os.getenv("CAMERAS", "") or ("wrist:mock,fixed:mock" if mock else "")  # role:serial,... (teleop.local.env)
     if not cameras or "<" in cameras:
         raise ValueError("CAMERAS not configured: set it in teleop.local.env (copy teleop.local.env.example)")
     roles = [item.split(":") for item in cameras.split(",")]
     root = Path(os.getenv("OUT_DIR", "data"))  # relative: next to this file
     root = root if root.is_absolute() else here / root
-    session = root / (time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8] + ("_mock" if mock else ""))
-    session.mkdir(parents=True, exist_ok=False)
+    task_name = os.getenv("TASK", "")
+    if not task_name or task_name.startswith(("_", ".")) or "/" in task_name:
+        raise ValueError(f"TASK {task_name!r}: start with teleop.sh, it asks for the task (or set TASK=<task name>)")
+    task = root / task_name
+    run = time.strftime("%Y%m%d_%H%M%S") + ("_mock" if mock else "")
+    run_dir = task / "_runs" / run
+    run_dir.mkdir(parents=True, exist_ok=False)  # also creates a new task's folder
+    count, last = last_episode(task)  # count = number of the task's last episode, of any run
     console = Console()
     node = Node()
     cams = [Camera(role, serial, size, fps, mock) for role, serial in roles]
-    meta = {"schema": "ur5-teleop-rgb-pose-v1", "simulated_camera": mock, "start_host_mono_ns": time.monotonic_ns(),
+    meta = {"schema": "ur5-teleop-rgb-pose-v1", "task": task_name, "run": run, "simulated_camera": mock,
+            "start_host_mono_ns": time.monotonic_ns(),
             "start_host_unix_ns": time.time_ns(), "color": {"width": size[0], "height": size[1], "fps": fps,
                                                             "format": "bgr8", "video": "mp4v"},
             "cameras": {c.role: {"serial": c.serial, "color_intrinsics": c.intrinsics} for c in cams},
             "max_pose_gap_ms": max_gap_ns / 1e6, "episode_plan": plan, "episodes": [],
             "timing": "frame_mono_ns = SDK global_time (host system clock) mapped to CLOCK_MONOTONIC at receive; "
                       "robot t_ns = CLOCK_MONOTONIC; pose = interpolation of robot.jsonl at frame_mono_ns",
-            "env": {k: os.environ[k] for k in ("CAMERAS", "COLOR_W", "COLOR_H", "FPS", "OUT_DIR", "EPISODE_PLAN",
+            "env": {k: os.environ[k] for k in ("TASK", "CAMERAS", "COLOR_W", "COLOR_H", "FPS", "OUT_DIR", "EPISODE_PLAN",
                                                 "DRY_RUN", "MOCK_CAMERA", "MOCK_MOUSE") if k in os.environ}}
 
     def save_meta():
-        (session / "session.json").write_text(json.dumps(meta, indent=1, allow_nan=False))
+        (run_dir / "session.json").write_text(json.dumps(meta, indent=1, allow_nan=False))
     save_meta()
     robot_t, robot_tcp, robot_flange = [], [], []
-    episode, count, end_reason, last_status = None, 0, "stopped", 0
+    episode, end_reason, last_status = None, "stopped", 0
 
     def label(i):
         return plan[i] if i < len(plan) else "episode"
 
+    def say_next():
+        if not plan or count < len(plan):
+            console.say(f"  Next: {count + 1:03d}_{label(count)}  press Space to start")
+        else:
+            console.say(f"  All {len(plan)} episodes of the plan are recorded")
+
     def start():
         nonlocal episode
-        episode = Episode(session, count + 1, label(count), cams, size, fps)
+        episode = Episode(task, count + 1, label(count), cams, size, fps, run)
         for c in cams:
             with c.lock:
                 c.episode = episode
@@ -310,10 +378,70 @@ def main():
         console.say(f"✓ {done.name} saved ({secs:.0f} s): " + ", ".join(parts))
 
     pending = []  # (episode, reason, close at monotonic ns): wait for the robot records after the last frame
-    console.say("Cameras started. Space = start / stop recording; h = home; Esc = home and quit.")
-    if os.getenv("START_RECORDING", "0") == "1":
-        start()
-    with (session / "robot.jsonl").open("w", buffering=1) as robot_log:
+    resets, homing = 0, None  # reset requests sent; monotonic ns of the one the robot is still homing for
+
+    def close(done, reason):
+        """Save a stopped episode, then (HOME_AFTER_EPISODE=1) send the robot home for the next one."""
+        nonlocal resets, homing
+        finish(done, reason)
+        if home_after:
+            resets, homing = resets + 1, time.monotonic_ns()
+            node.send_output("reset", pa.array([json.dumps({"id": resets})]))
+            console.say("  Reset for the next episode: opening the gripper, returning home ...")
+        else:
+            say_next()
+
+    def beat(now):
+        """Heartbeat to the ur5 node while every camera delivers frames; `recording`: the SpaceMouse may move the
+        robot (only while an episode is being recorded)."""
+        if all(now - c.last_ns < 5e8 for c in cams):
+            node.send_output("heartbeat", pa.array([json.dumps({"t_ns": now, "recording": episode is not None})]))
+
+    def busy():
+        """-> why Space cannot start an episode now, or None."""
+        if pending:
+            return "saving the last episode"
+        if not robot_t or homing is not None:
+            return "the robot is returning home"
+        return None
+
+    def ask_delete():
+        """d: -> the episode directory to delete if y follows (the task's last one, of any run), or None."""
+        if episode is not None:
+            console.say(f"  Recording {episode.name}: stop it first (Space), then d deletes it")
+            return None
+        path = last_episode(task)[1]
+        if path is None:
+            console.say(f"  No episode of task {task_name} to delete")
+        return path
+
+    def delete(path):
+        nonlocal count
+        while pending:  # stopped < 0.2 s ago: close it before removing it
+            close(*pending.pop(0)[:2])
+        meta_path = run_meta_path(path)  # read before the episode.json is gone
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            console.say(f"✗ Could not delete {path.name}: {exc}")
+            return
+        if path.name in meta["episodes"]:  # recorded in this run
+            meta["episodes"].remove(path.name)
+            save_meta()
+        else:
+            forget_episode(meta_path, path.name)
+        count = last_episode(task)[0]
+        console.say(f"  Deleted {path.name}")
+        if homing is None:  # otherwise Next follows once the robot is home
+            say_next()
+
+    asked = None  # episode directory waiting for y after d
+    console.say("Cameras started. The SpaceMouse moves the robot only while recording. Space = start / stop "
+                "recording; d then y = delete the last episode; h = home; Esc = home and quit.")
+    console.say(f"Task {task_name}: last episode {describe(last)}" if last else f"Task {task_name}: no episodes yet")
+    auto_start = os.getenv("START_RECORDING", "0") == "1"  # tests: as if Space were pressed as soon as it may be
+    say_next()
+    with (run_dir / "robot.jsonl").open("w", buffering=1) as robot_log:
         try:
             for event in node:
                 if event["type"] == "STOP":
@@ -328,37 +456,61 @@ def main():
                     robot_t.append(r["t_ns"])
                     robot_tcp.append(r["tcp_pose"])
                     robot_flange.append(r["flange_pose"])
+                    if homing is not None and r.get("reset_done", 0) >= resets:
+                        homing, last_status = None, 0  # status line: Ready at the next tick
+                        say_next()
                 elif event["id"] == "record":
                     if episode is not None:
                         pending.append((stop(), "stopped", now + 2e8))
+                    elif why := busy():
+                        console.say(f"  Wait: {why}")
                     else:
                         start()
+                    beat(now)  # the SpaceMouse takes / loses the robot now, not at the next tick
+                elif event["id"] == "delete":  # keyboard: d -> "ask"; the next key -> "yes" (y) or "no" (any other)
+                    answer, last_status = event["value"][0].as_py(), 0  # show / clear the question at the next tick
+                    if answer == "ask":
+                        asked = ask_delete()
+                    elif asked:
+                        if answer == "yes":
+                            delete(asked)
+                        else:
+                            console.say(f"  Kept {asked.name}")
+                        asked = None
                 elif event["id"] == "tick":
                     for c in cams:
                         if c.error is not None:
                             raise RuntimeError(f"{c.role} camera: {c.error}")
-                    alive = all(now - c.last_ns < 5e8 for c in cams)
                     if not robot_t and now - meta["start_host_mono_ns"] > 60e9:  # homing (countdown + moveJ) < 60 s
                         raise RuntimeError("No robot state within 60 s: the ur5 node is not running (see the ur5 errors in the log)")
-                    if alive:
-                        node.send_output("heartbeat", pa.array([json.dumps({"t_ns": now})]))
+                    if auto_start and episode is None and not busy():
+                        auto_start = False
+                        start()
+                    beat(now)
                     while pending and pending[0][2] <= now:
                         done, reason, _ = pending.pop(0)
-                        finish(done, reason)
-                        if not plan or count < len(plan):
-                            console.say(f"  Next: {count + 1:03d}_{label(count)}  press Space to start")
+                        close(done, reason)
                     if now - last_status >= 1e9:
                         last_status = now
                         stale = [c.role for c in cams if now - c.last_ns >= 5e8]
-                        robot = ("waiting for the robot to reach home ..." if not robot_t else
-                                 "robot state stopped (ur5 node exited? see the log)" if now - robot_t[-1] > 5e8 else "")
+                        if not robot_t or homing is not None and now - homing < 60e9:  # moveJ home < 60 s
+                            robot = "waiting for the robot to reach home ..."
+                        elif homing is not None:
+                            robot = "the robot did not reach home within 60 s (ur5 node exited? see the log)"
+                        elif now - robot_t[-1] > 5e8:
+                            robot = "robot state stopped (ur5 node exited? see the log)"
+                        else:
+                            robot = ""
                         warn = "; ".join(filter(None, [f"{'/'.join(stale)} camera not delivering frames, robot locked" if stale else "", robot]))
                         if episode is not None:
                             s = (now - episode.info["start_host_mono_ns"]) / 1e9
                             console.status(f"● Recording {episode.name}  {int(s // 60):02d}:{int(s % 60):02d}"
                                            + (f"  ⚠ {warn}" if warn else ""))
                         else:
-                            console.status(f"⚠ {warn}" if warn else "Ready: press Space to start recording")
+                            ask = f"Delete {asked.name}? y = delete, any other key = keep" if asked else ""
+                            console.status("  ".join(filter(None, [ask, f"⚠ {warn}" if warn else ""]))
+                                           or "Ready: press Space to start recording (the robot follows the "
+                                              "SpaceMouse only while recording)")
         except BaseException:
             end_reason = "error"
             raise
@@ -371,7 +523,7 @@ def main():
                 c.stop()
             meta["end_host_mono_ns"] = time.monotonic_ns()
             save_meta()
-            console.say(f"Exited. Recorded {len(meta['episodes'])} episode(s) this run, data in {session}")
+            console.say(f"Exited. Recorded {len(meta['episodes'])} episode(s) this run, task {task_name} in {task}")
 
 
 if __name__ == "__main__":

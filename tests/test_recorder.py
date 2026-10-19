@@ -70,6 +70,53 @@ class TestPlan(unittest.TestCase):
         self.assertEqual(r.safe_label(" / "), "episode")
 
 
+class TestEarlierRuns(unittest.TestCase):
+    def make(self, root, path, info=None, meta=None):
+        (root / path).mkdir(parents=True)
+        if info is not None:
+            (root / path / "episode.json").write_text(json.dumps(info))
+        if meta is not None:
+            (root / path / "session.json").write_text(json.dumps(meta))
+
+    def test_last_episode_of_the_task_over_all_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = Path(tmp) / "pick"
+            self.assertEqual(r.last_episode(task), (0, None))  # new task: no folder yet
+            for p in ("pick/001_a", "pick/002_b", "pick/003_c", "pick/_runs/20261019_100000", "pick/notes",
+                      "other/009_x"):
+                self.make(Path(tmp), p)
+            (task / "004_file").write_text("")  # a file, not an episode directory
+            self.assertEqual(r.last_episode(task), (3, task / "003_c"))  # other tasks do not count
+            self.make(Path(tmp), "pick/1000_d")  # past 999: compared as numbers, not text
+            self.assertEqual(r.last_episode(task)[0], 1000)
+
+    def test_describe_saved_and_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make(root, "t/005_pick", {"completed": True, "start_host_mono_ns": 0,
+                                           "end_host_mono_ns": 54_200_000_000, "end_reason": "stopped"})
+            self.make(root, "t/006_place", {"completed": False})
+            self.make(root, "t/007_x")  # no episode.json at all
+            self.assertEqual(r.describe(root / "t/005_pick"), "005_pick (54 s, saved)")
+            self.assertIn("006_place (INCOMPLETE", r.describe(root / "t/006_place"))
+            self.assertIn("INCOMPLETE", r.describe(root / "t/007_x"))
+
+    def test_run_meta_path_and_forget_episode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make(root, "t/_runs/20261019_100000", meta={"episodes": ["001_a", "002_b"], "schema": "x"})
+            self.make(root, "t/002_b", {"run": "20261019_100000"})
+            self.make(root, "old/001_a", {"completed": True})  # older layout: session.json next to the episodes
+            meta_path = r.run_meta_path(root / "t/002_b")
+            self.assertEqual(meta_path, root / "t/_runs/20261019_100000/session.json")
+            self.assertEqual(r.run_meta_path(root / "old/001_a"), root / "old/session.json")
+            r.forget_episode(meta_path, "002_b")
+            self.assertEqual(json.loads(meta_path.read_text()), {"episodes": ["001_a"], "schema": "x"})
+            r.forget_episode(meta_path, "002_b")  # not listed any more: no error
+            r.forget_episode(root / "old/session.json", "001_a")  # no session.json: no error
+            self.assertFalse((root / "old/session.json").exists())
+
+
 class TestEpisode(unittest.TestCase):
     def test_video_frames_and_poses_line_up(self):
         class Cam:
@@ -94,7 +141,9 @@ class TestEpisode(unittest.TestCase):
             import cv2
             video = cv2.VideoCapture(str(Path(tmp) / "001_x" / "wrist.mp4"))
             self.assertEqual(int(video.get(cv2.CAP_PROP_FRAME_COUNT)), 10)
-            self.assertTrue(json.loads((Path(tmp) / "001_x" / "episode.json").read_text())["completed"])
+            info = json.loads((Path(tmp) / "001_x" / "episode.json").read_text())
+            self.assertTrue(info["completed"])
+            self.assertEqual((info["task"], info["run"]), (Path(tmp).name, None))
 
 
 if __name__ == "__main__":

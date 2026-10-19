@@ -3,7 +3,7 @@
 # and only checks that it reaches its first operator prompt within 15 s. Checks nothing about the output.
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-OUT_DIR="$TMP" DRY_RUN=1 MOCK_CAMERA=1 MOCK_MOUSE=1 setsid "$(dirname "$(realpath "$0")")/../teleop.sh" </dev/null >/dev/null 2>&1 &
+OUT_DIR="$TMP" TASK=smoke DRY_RUN=1 MOCK_CAMERA=1 MOCK_MOUSE=1 setsid "$(dirname "$(realpath "$0")")/../teleop.sh" </dev/null >/dev/null 2>&1 &
 pid=$!
 for _ in $(seq 30); do
   if grep -qs "Cameras started" "$TMP"/_logs/teleop_*.log; then

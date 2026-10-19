@@ -1,6 +1,11 @@
-"""INTEGRATION test: the whole dataflow (spacemouse, keyboard, ur5, recorder) under `dora run` with mock mouse,
-mock cameras and DRY_RUN=1 (no robot). The first episode starts by itself; Ctrl-C (SIGINT) after ~12 s ends the
-run; the session must hold robot.jsonl, two videos whose frame counts equal their CSV rows, and poses."""
+"""INTEGRATION tests: the whole dataflow (spacemouse, keyboard, ur5, recorder) under `dora run`, and teleop.sh with
+its task question, all with mock mouse, mock cameras and DRY_RUN=1 (no robot).
+- complete episode: the first episode starts by itself; Ctrl-C (SIGINT) after ~12 s ends the run; the task folder
+  must hold the episode (two videos whose frame counts equal their CSV rows, and poses) and the run's robot.jsonl.
+- keys typed into a pseudo-terminal (the dataflow's controlling terminal): Space records, d then y deletes, d then
+  another key keeps; after each episode the robot is reset (gripper open, home); a restart continues the task;
+  the (mock) SpaceMouse moves the robot only while an episode is recorded.
+- teleop.sh: n + a task name starts that task folder at 001; a restart with e continues it."""
 import csv
 import json
 import os
@@ -13,36 +18,217 @@ import unittest
 
 import cv2
 
+from tests.ptyutil import PtyProcess
+
 HERE = Path(__file__).resolve().parents[1]
+
+
+def mock_env(tmp, **extra):
+    return {**os.environ, "OUT_DIR": tmp, "DRY_RUN": "1", "MOCK_CAMERA": "1", "MOCK_MOUSE": "1", "TASK": "t", **extra}
+
+
+def dora(env, cwd, log):
+    return PtyProcess(["dora", "run", str(HERE / "dataflow.yml")], env, cwd, stdout=log, stderr=subprocess.STDOUT)
+
+
+def record(run, name, at):
+    run.key(b" ")
+    at = run.wait_for(f"Recording {name}", at)
+    time.sleep(1.5)
+    run.key(b" ")
+    return run.wait_for(f"{name} saved", at)
+
+
+def episode_dirs(task):
+    return sorted(p.name for p in task.iterdir() if p.is_dir() and p.name != "_runs")
 
 
 class TestDataflow(unittest.TestCase):
     def test_mock_run_writes_complete_episode(self):
         with tempfile.TemporaryDirectory() as tmp:
-            env = {**os.environ, "OUT_DIR": tmp, "DRY_RUN": "1", "MOCK_CAMERA": "1", "MOCK_MOUSE": "1",
-                   "START_RECORDING": "1"}
+            env = mock_env(tmp, START_RECORDING="1")
             proc = subprocess.Popen(["dora", "run", str(HERE / "dataflow.yml")], cwd=tmp, env=env,
                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             time.sleep(12)
             proc.send_signal(signal.SIGINT)
             log = proc.communicate(timeout=30)[0].decode(errors="replace")
-            sessions = [p for p in Path(tmp).iterdir() if (p / "session.json").exists()]
-            self.assertEqual(len(sessions), 1, log[-3000:])
-            session = sessions[0]
-            self.assertGreater(sum(1 for _ in (session / "robot.jsonl").open()), 500)  # 125 Hz for ~10 s
-            meta = json.loads((session / "session.json").read_text())
-            self.assertEqual(meta["episodes"], ["001_episode"])
-            info = json.loads((session / "001_episode" / "episode.json").read_text())
+            task = Path(tmp) / "t"
+            runs = sorted((task / "_runs").glob("*/session.json"))
+            self.assertEqual(len(runs), 1, log[-3000:])
+            run = runs[0].parent
+            with (run / "robot.jsonl").open() as f:
+                self.assertGreater(sum(1 for _ in f), 500)  # 125 Hz for ~10 s
+            meta = json.loads((run / "session.json").read_text())
+            self.assertEqual((meta["task"], meta["run"], meta["episodes"]), ("t", run.name, ["001_episode"]))
+            info = json.loads((task / "001_episode" / "episode.json").read_text())
             self.assertTrue(info["completed"])
+            self.assertEqual((info["task"], info["run"]), ("t", run.name))
             for role in ("wrist", "fixed"):
-                rows = list(csv.DictReader((session / "001_episode" / f"{role}_frames.csv").open()))
-                video = cv2.VideoCapture(str(session / "001_episode" / f"{role}.mp4"))
+                with (task / "001_episode" / f"{role}_frames.csv").open() as f:
+                    rows = list(csv.DictReader(f))
+                video = cv2.VideoCapture(str(task / "001_episode" / f"{role}.mp4"))
                 self.assertGreater(len(rows), 100)
                 self.assertEqual(int(video.get(cv2.CAP_PROP_FRAME_COUNT)), len(rows))
                 self.assertEqual(info["cameras"][role]["frames"], len(rows))
                 self.assertEqual(info["cameras"][role]["frame_number_gaps"], 0)
                 valid = sum(int(x["pose_valid"]) for x in rows)
                 self.assertGreaterEqual(valid, len(rows) - 2)  # the last frames may follow the last robot record
+
+    def test_d_then_y_deletes_the_last_episode(self):
+        with tempfile.TemporaryDirectory() as tmp, open(Path(tmp) / "dora.log", "w") as log:
+            run = dora(mock_env(tmp), tmp, log)
+            task = Path(tmp) / "t"
+            try:
+                at = run.wait_for("Ready: press Space")
+                meta_file = next((task / "_runs").glob("*/session.json"))
+                run.key(b"d")
+                at = run.wait_for("No episode of task t to delete", at)
+                run.key(b" ")  # answers "no" to the d (nothing asked) and still starts recording
+                at = run.wait_for("Recording 001_episode", at)
+                run.key(b"d")
+                at = run.wait_for("stop it first", at)
+                time.sleep(1.5)
+                run.key(b" ")  # still stops the recording
+                at = run.wait_for("001_episode saved", at)
+                self.assertTrue((task / "001_episode").is_dir())
+                run.key(b"d")
+                at = run.wait_for("Delete 001_episode? y = delete", at)
+                run.key(b"y")
+                at = run.wait_for("Deleted 001_episode", at)
+                self.assertFalse((task / "001_episode").exists())
+                self.assertEqual(json.loads(meta_file.read_text())["episodes"], [])
+                at = run.wait_for("Next: 001_episode", at)  # the number is free again, once the robot is reset
+                self.assertNotIn(b"Wait:", run.out)  # no Space was refused: Next only appears when Space works
+                at = record(run, "001_episode", at)
+                run.key(b"d")
+                at = run.wait_for("Delete 001_episode? y = delete", at)
+                run.key(b"n")
+                run.wait_for("Kept 001_episode", at)
+            finally:
+                run.stop()
+            self.assertEqual(json.loads(meta_file.read_text())["episodes"], ["001_episode"])
+            self.assertEqual(episode_dirs(task), ["001_episode"])
+            self.assertTrue(json.loads((task / "001_episode" / "episode.json").read_text())["completed"])
+
+    def test_robot_returns_home_after_each_episode(self):
+        with tempfile.TemporaryDirectory() as tmp, open(Path(tmp) / "dora.log", "w") as log:
+            run = dora(mock_env(tmp), tmp, log)
+            try:
+                at = run.wait_for("Ready: press Space")
+                run.key(b" ")
+                at = run.wait_for("Recording 001_episode", at)
+                time.sleep(1.5)
+                run.key(b"  ")  # stop, and Space again at once: refused until saved and home
+                run.wait_for("Wait: saving the last episode", at)
+                at = run.wait_for("001_episode saved", at)
+                at = run.wait_for("Reset for the next episode: opening the gripper, returning home", at)
+                at = run.wait_for("Next: 002_episode", at)
+                self.assertNotIn(b"Recording 002_episode", run.out[:at])
+                run.key(b" ")
+                run.wait_for("Recording 002_episode", at)
+            finally:
+                run.stop()
+            text = (Path(tmp) / "dora.log").read_text()
+            self.assertIn("DRY reset: would moveJ home", text)
+            self.assertEqual(text.count("Opening the gripper"), 2)  # start-up + the one reset
+            self.assertLess(text.rindex("Opening the gripper"), text.index("DRY reset: would moveJ home"))
+
+    def test_spacemouse_moves_the_robot_only_while_recording(self):
+        with tempfile.TemporaryDirectory() as tmp, open(Path(tmp) / "dora.log", "w") as log:
+            run = dora(mock_env(tmp, MOCK_AXES="[0.5, 0, 0, 0, 0, 0]"), tmp, log)  # cap pushed along +x all along
+            try:
+                at = run.wait_for("Ready: press Space")
+                time.sleep(1)  # pushed, not recording
+                at = record(run, "001_episode", at)
+                at = run.wait_for("Next: 002_episode", at)
+                time.sleep(1)  # pushed, between episodes
+            finally:
+                run.stop()
+            task = Path(tmp) / "t"
+            info = json.loads((task / "001_episode" / "episode.json").read_text())
+            run_dir = next((task / "_runs").iterdir())
+            with (run_dir / "robot.jsonl").open() as f:
+                records = [json.loads(line) for line in f]
+            with (task / "001_episode" / "wrist_frames.csv").open() as f:
+                frames = list(csv.DictReader(f))
+            start, saved = info["start_host_mono_ns"], info["end_host_mono_ns"]
+            stop = int(frames[-1]["host_receive_mono_ns"])  # Space; end_host_mono_ns is the save, 0.2 s later
+            before = [r for r in records if r["t_ns"] < start]
+            during = [r for r in records if start + 1e8 < r["t_ns"] < stop]
+            after = [r for r in records if r["t_ns"] > saved + 1e8]
+            self.assertGreater(min(len(before), len(during), len(after)), 50)
+            x = lambda rs: [r["tcp_pose"][0] for r in rs]
+            self.assertEqual(len(set(x(before))), 1)  # before Space: not one step, although pushed
+            self.assertTrue(all(r["hard_stop"] and not r["recording"] for r in before))
+            self.assertTrue(all(not r["hard_stop"] and r["recording"] for r in during))
+            self.assertGreater(x(during)[-1] - x(during)[0], 0.02)  # 0.04 m/s while recording
+            self.assertEqual(len(set(x(after))), 1)  # after the episode: locked again
+            self.assertTrue(all(r["hard_stop"] and not r["recording"] for r in after))
+
+    def test_restart_continues_the_task(self):
+        with tempfile.TemporaryDirectory() as tmp, open(Path(tmp) / "dora.log", "w") as log:
+            task = Path(tmp) / "t"
+            first = dora(mock_env(tmp), tmp, log)
+            try:
+                at = first.wait_for("Task t: no episodes yet")
+                at = first.wait_for("Next: 001_episode", at)
+                first.wait_for("Ready: press Space", at)
+                record(first, "001_episode", at)
+            finally:
+                first.stop()
+            second = dora(mock_env(tmp), tmp, log)
+            try:
+                at = second.wait_for("Task t: last episode 001_episode (")
+                at = second.wait_for("s, saved)", at)
+                at = second.wait_for("Next: 002_episode", at)
+                second.wait_for("Ready: press Space", at)
+                at = record(second, "002_episode", at)
+                second.key(b"d")
+                at = second.wait_for("Delete 002_episode? y = delete", at)
+                second.key(b"y")
+                at = second.wait_for("Deleted 002_episode", at)
+                at = second.wait_for("Next: 002_episode", at)
+                second.key(b"d")  # now the last episode is the one of the first run
+                at = second.wait_for("Delete 001_episode? y = delete", at)
+                second.key(b"y")
+                at = second.wait_for("Deleted 001_episode", at)
+                at = second.wait_for("Next: 001_episode", at)
+                record(second, "001_episode", at)
+            finally:
+                second.stop()
+            run1, run2 = sorted((task / "_runs").iterdir())
+            self.assertEqual(json.loads((run1 / "session.json").read_text())["episodes"], [])
+            self.assertEqual(json.loads((run2 / "session.json").read_text())["episodes"], ["001_episode"])
+            self.assertEqual(episode_dirs(task), ["001_episode"])
+            self.assertEqual(json.loads((task / "001_episode" / "episode.json").read_text())["run"], run2.name)
+
+    def test_teleop_sh_new_task_then_continue_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {k: v for k, v in mock_env(tmp).items() if k != "TASK"}  # teleop.sh asks for it
+            first = PtyProcess([str(HERE / "teleop.sh")], env, tmp)
+            try:
+                at = first.wait_for("No tasks in")
+                at = first.wait_for("Name of the new task: ", at)
+                first.key(b"pick cup\n")
+                at = first.wait_for("folder name: pick_cup", at)
+                at = first.wait_for("Task pick_cup: no episodes yet", at)
+                at = first.wait_for("Ready: press Space", at)
+                record(first, "001_episode", at)
+                first.key(b"\x03")  # Ctrl-C quits
+                first.proc.wait(timeout=60)
+            finally:
+                first.stop()
+            task = Path(tmp) / "pick_cup"
+            self.assertEqual(episode_dirs(task), ["001_episode"])
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir() if p.is_dir()), ["_logs", "pick_cup"])
+            second = PtyProcess([str(HERE / "teleop.sh")], env, tmp)
+            try:
+                at = second.wait_for("1  pick_cup  (1 episode, last 001_episode)")
+                second.key(b"e")  # the only task: no number to choose
+                at = second.wait_for("Task pick_cup: last episode 001_episode (", at)
+                second.wait_for("Next: 002_episode", at)
+            finally:
+                second.stop()
 
 
 if __name__ == "__main__":

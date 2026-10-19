@@ -9,7 +9,7 @@ import socket
 import time
 import numpy as np
 from dora import Node
-from common import map_motion, number, send_json
+from common import map_motion, number, send_json, vector
 
 
 def daemon_alive(sock):
@@ -24,6 +24,7 @@ def daemon_alive(sock):
 
 def main():
     mock = os.getenv("MOCK_MOUSE", "0") == "1"
+    mock_axes = os.getenv("MOCK_AXES", "") if mock else ""  # tests: the mock cap held at this deflection, enabled
     maximum = number("MOUSE_MAX", 300)
     deadzone = float(os.getenv("DEADZONE", "0.2"))
     # Button press (edge) -> event; no enable button: pushing the cap moves the arm.
@@ -41,7 +42,7 @@ def main():
         spnav.spnav_open()
         sock = socket.socket(fileno=os.dup(spnav.spnav_fd()))  # own handle on the daemon socket, for peeking
     node = Node()
-    axes, buttons = np.zeros(6), {}
+    axes, buttons = vector("MOCK_AXES", mock_axes, 6) if mock_axes else np.zeros(6), {}
     try:
         for event in node:
             if event["type"] == "STOP":
@@ -67,7 +68,8 @@ def main():
                 if not received and not daemon_alive(sock):
                     raise RuntimeError("spacenavd connection lost")
             # Every tick: t_ns lets ur5 detect a dead node; the axes are the last deflection.
-            send_json(node, "command", {"t_ns": time.monotonic_ns(), "axes": axes.tolist(), "enabled": not mock})
+            send_json(node, "command", {"t_ns": time.monotonic_ns(), "axes": axes.tolist(),
+                                        "enabled": not mock or bool(mock_axes)})
     finally:
         if not mock:
             sock.close()
