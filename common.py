@@ -11,17 +11,26 @@ def number(name, default):
     return value
 
 
-def map_motion(raw, maximum=300.0, deadzone=0.2):
-    """Same spnav axis convention as zestcode/ur3-neu-dev: [-z, x, y]."""
+def map_motion(raw, maximum=300.0, deadzone=0.2, rotation_deadzone=None, rotation_curve=1.0,
+               rotation_coupling=0.0):
+    """Same spnav axis convention as zestcode/ur3-neu-dev: [-z, x, y].
+    Rotation is shaped on its own (defaults: like translation): `rotation_deadzone`; output raised to
+    `rotation_curve` (> 1: finer near the centre, full scale unchanged); and, since pushing the cap also
+    tilts it, its deadzone edge moves out by `rotation_coupling` x the translation output norm."""
     raw = np.asarray(raw, dtype=float)
     if raw.shape != (6,) or not np.isfinite(raw).all():
         raise ValueError("Expected six finite spnav axes")
-    if maximum <= 0 or not 0 <= deadzone < 1:
-        raise ValueError("Invalid normalization or deadzone")
+    rotation_deadzone = deadzone if rotation_deadzone is None else rotation_deadzone
+    if (maximum <= 0 or not 0 <= deadzone < 1 or not 0 <= rotation_deadzone < 1
+            or not 0 < rotation_curve < np.inf or not 0 <= rotation_coupling < np.inf):
+        raise ValueError("Invalid normalization, deadzone or rotation shaping")
     raw = np.clip(raw / maximum, -1, 1)
     # Rescale past the deadzone so output rises continuously from 0 at its edge (no step).
-    raw = np.sign(raw) * np.maximum(np.abs(raw) - deadzone, 0) / (1 - deadzone)
-    return raw[[2, 0, 1, 5, 3, 4]] * [-1, 1, 1, -1, 1, 1]
+    move = np.sign(raw[:3]) * np.maximum(np.abs(raw[:3]) - deadzone, 0) / (1 - deadzone)
+    # A moved edge keeps the same slope (no step either); while translating, full scale may not be reached.
+    edge = rotation_deadzone + rotation_coupling * np.linalg.norm(move)
+    turn = np.maximum(np.abs(raw[3:]) - edge, 0) / (1 - rotation_deadzone)
+    return np.r_[move, np.sign(raw[3:]) * turn ** rotation_curve][[2, 0, 1, 5, 3, 4]] * [-1, 1, 1, -1, 1, 1]
 
 
 def command_live(command, now_ns, timeout_s):

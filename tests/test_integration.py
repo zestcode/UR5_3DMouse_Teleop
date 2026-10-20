@@ -1,15 +1,18 @@
 """INTEGRATION tests: the whole dataflow (spacemouse, keyboard, ur5, recorder) under `dora run`, and teleop.sh with
 its task question, all with mock mouse, mock cameras and DRY_RUN=1 (no robot).
 - complete episode: the first episode starts by itself; Ctrl-C (SIGINT) after ~12 s ends the run; the task folder
-  must hold the episode (two videos whose frame counts equal their CSV rows, and poses) and the run's robot.jsonl.
-- keys typed into a pseudo-terminal (the dataflow's controlling terminal): Space records, d then y deletes, d then
-  another key keeps; after each episode the robot is reset (gripper open, home); a restart continues the task;
+  must hold the episode (two videos whose frame counts equal their CSV rows, and poses), the run's robot.jsonl,
+  task.json with the instruction, and the episode's VPP export (annotation + one 256 x 256 video per camera).
+- keys typed into a pseudo-terminal (the dataflow's controlling terminal): Space records, d then y deletes (the
+  VPP export too), d then another key keeps; after each episode the robot is reset (gripper open, home); a restart continues the task;
   the (mock) SpaceMouse moves the robot only while an episode is recorded.
-- teleop.sh: n + a task name starts that task folder at 001; a restart with e continues it."""
+- teleop.sh: n + a task name + its instruction starts that task folder at 001; a restart with e continues it
+  without asking the instruction again."""
 import csv
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import tempfile
@@ -17,6 +20,7 @@ import time
 import unittest
 
 import cv2
+import numpy as np
 
 from tests.ptyutil import PtyProcess
 
@@ -40,7 +44,7 @@ def record(run, name, at):
 
 
 def episode_dirs(task):
-    return sorted(p.name for p in task.iterdir() if p.is_dir() and p.name != "_runs")
+    return sorted(p.name for p in task.iterdir() if p.is_dir() and re.match(r"\d+_", p.name))
 
 
 class TestDataflow(unittest.TestCase):
@@ -73,6 +77,26 @@ class TestDataflow(unittest.TestCase):
                 self.assertEqual(info["cameras"][role]["frame_number_gaps"], 0)
                 valid = sum(int(x["pose_valid"]) for x in rows)
                 self.assertGreaterEqual(valid, len(rows) - 2)  # the last frames may follow the last robot record
+            self.assertEqual((info["instruction"], meta["instruction"]), ("t", "t"))  # default: the task name
+            self.assertEqual(json.loads((task / "task.json").read_text()), {"instruction": "t"})
+            vpp = task / "_vpp"
+            ann = json.loads((vpp / "annotation" / "train" / "1.json").read_text())
+            self.assertEqual((ann["texts"], ann["episode_id"], ann["cameras"]), (["t"], 1, ["fixed", "wrist"]))
+            self.assertGreater(ann["video_length"], 80)  # ~10 s at 10 Hz
+            n = ann["video_length"]
+            self.assertEqual((np.shape(ann["states"]), np.shape(ann["actions"])), ((n, 10), (n, 10)))
+            np.testing.assert_allclose(np.diff(ann["source"]["t_ns"]), 1e8)
+            for k, role in enumerate(ann["cameras"]):
+                video = cv2.VideoCapture(str(vpp / ann["videos"][k]["video_path"]))
+                self.assertEqual((int(video.get(cv2.CAP_PROP_FRAME_COUNT)), video.get(cv2.CAP_PROP_FRAME_WIDTH),
+                                  video.get(cv2.CAP_PROP_FRAME_HEIGHT)), (n, 256, 256))
+                index = ann["source"]["frame_index"][role]
+                self.assertTrue(0 <= index[0] and index[-1] < info["cameras"][role]["frames"])
+                with (task / "001_episode" / f"{role}_frames.csv").open() as f:
+                    t = np.array([int(x["frame_mono_ns"]) for x in csv.DictReader(f)])
+                gap_ms = np.diff(t[index[0]:index[-1] + 1]).max() / 1e6
+                self.assertLessEqual(ann["source"]["max_offset_ms"][role], gap_ms / 2 + 1e-3)  # the nearest frame
+            self.assertIn("VPP: 001_episode exported (train 1,", log)
 
     def test_d_then_y_deletes_the_last_episode(self):
         with tempfile.TemporaryDirectory() as tmp, open(Path(tmp) / "dora.log", "w") as log:
@@ -91,11 +115,15 @@ class TestDataflow(unittest.TestCase):
                 run.key(b" ")  # still stops the recording
                 at = run.wait_for("001_episode saved", at)
                 self.assertTrue((task / "001_episode").is_dir())
+                run.wait_for("VPP: 001_episode exported", at)
+                self.assertTrue((task / "_vpp" / "annotation" / "train" / "1.json").is_file())
                 run.key(b"d")
                 at = run.wait_for("Delete 001_episode? y = delete", at)
                 run.key(b"y")
                 at = run.wait_for("Deleted 001_episode", at)
                 self.assertFalse((task / "001_episode").exists())
+                self.assertFalse((task / "_vpp" / "annotation" / "train" / "1.json").exists())
+                self.assertFalse((task / "_vpp" / "videos" / "train" / "1").exists())
                 self.assertEqual(json.loads(meta_file.read_text())["episodes"], [])
                 at = run.wait_for("Next: 001_episode", at)  # the number is free again, once the robot is reset
                 self.assertNotIn(b"Wait:", run.out)  # no Space was refused: Next only appears when Space works
@@ -211,6 +239,9 @@ class TestDataflow(unittest.TestCase):
                 at = first.wait_for("Name of the new task: ", at)
                 first.key(b"pick cup\n")
                 at = first.wait_for("folder name: pick_cup", at)
+                at = first.wait_for('Instruction for this task, one English sentence (Enter = "pick cup"): ', at)
+                first.key(b"pick up the cup\n")
+                at = first.wait_for("Instruction: pick up the cup", at)
                 at = first.wait_for("Task pick_cup: no episodes yet", at)
                 at = first.wait_for("Ready: press Space", at)
                 record(first, "001_episode", at)
@@ -220,11 +251,15 @@ class TestDataflow(unittest.TestCase):
                 first.stop()
             task = Path(tmp) / "pick_cup"
             self.assertEqual(episode_dirs(task), ["001_episode"])
+            self.assertEqual(json.loads((task / "task.json").read_text()), {"instruction": "pick up the cup"})
+            self.assertEqual(json.loads((task / "001_episode" / "episode.json").read_text())["instruction"],
+                             "pick up the cup")
             self.assertEqual(sorted(p.name for p in Path(tmp).iterdir() if p.is_dir()), ["_logs", "pick_cup"])
             second = PtyProcess([str(HERE / "teleop.sh")], env, tmp)
             try:
                 at = second.wait_for("1  pick_cup  (1 episode, last 001_episode)")
                 second.key(b"e")  # the only task: no number to choose
+                at = second.wait_for("Instruction: pick up the cup", at)  # from task.json: not asked again
                 at = second.wait_for("Task pick_cup: last episode 001_episode (", at)
                 second.wait_for("Next: 002_episode", at)
             finally:

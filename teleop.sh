@@ -3,7 +3,9 @@
 # Usage: <this dir>/teleop.sh [episode_plan.txt]   line NNN of the plan labels episode NNN; default 001_episode, 002_episode ...
 #       first asks: e = continue an existing task, n = new task (its name); episodes go to OUT_DIR/<task>/, numbered
 #       from 001 within the task and continuing after its last episode (shown at start-up)
-#       DRY_RUN=1 no robot; OUT_DIR=<dir> data location (default <this dir>/data); TASK=<name> skips the question
+#       then the task's instruction (one English sentence; kept in <task>/task.json, asked once per task)
+#       DRY_RUN=1 no robot; OUT_DIR=<dir> data location (default <this dir>/data); TASK=<name> skips the questions;
+#       INSTRUCTION=<sentence> sets the instruction
 # Machine settings (robot IP, camera serials, Python env) come from teleop.local.env next to this script
 # (copy teleop.local.env.example; not committed). Variables already set in the shell take precedence.
 HERE="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
@@ -23,9 +25,12 @@ export OUT_DIR="$(realpath -m "${OUT_DIR:-$HERE/data}")"
 mkdir -p "$OUT_DIR/_logs"
 LOG="$OUT_DIR/_logs/teleop_$(date +%Y%m%d_%H%M%S).log"
 export DRY_RUN="${DRY_RUN:-0}"
-TASK="$(python "$HERE/task.py")" || exit 1
-export TASK
+CHOICE="$(python "$HERE/task.py")" || exit 1  # two lines: task name, instruction
+TASK="${CHOICE%%$'\n'*}"
+INSTRUCTION="${CHOICE#*$'\n'}"
+export TASK INSTRUCTION
 echo "Task: $TASK  (episodes in $OUT_DIR/$TASK)"
+echo "Instruction: $INSTRUCTION"
 echo "Preflight:"
 python "$HERE/preflight.py" || exit 1
 echo "Starting: in 3 s the gripper opens and the robot returns home automatically (keep the e-stop at hand). Full log: $LOG"

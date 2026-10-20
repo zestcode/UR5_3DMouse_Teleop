@@ -2,8 +2,12 @@
 
 A task is the folder OUT_DIR/<task name>/: its episodes <NNN>_<label>/ are numbered from 001 within the task, and
 _runs/<start time>/ holds session.json + robot.jsonl of each teleop run (written by recorder.py).
-Questions go to stderr, the chosen task name to stdout. TASK=<name> skips the questions (tests, scripts). Ctrl-C
-aborts. No folder is created here: the recorder creates a new task's folder when it starts."""
+Then the task's language instruction (one English sentence, for language-conditioned policies such as VPP): from
+the task's task.json (written by the recorder), else asked, Enter = the task name with spaces.
+Questions go to stderr; stdout gets two lines: the task name, then the instruction. TASK=<name> skips the questions
+(tests, scripts; instruction: INSTRUCTION, else task.json, else the name), INSTRUCTION=<sentence> the instruction
+question. Ctrl-C aborts. No folder is created here: the recorder creates a new task's folder when it starts."""
+import json
 import os
 from pathlib import Path
 import re
@@ -27,6 +31,18 @@ def tasks(root):
                               if p.is_dir() and (m := re.match(r"(\d+)_", p.name)))
             found.append((path.stat().st_mtime, path.name, len(episodes), episodes[-1][1] if episodes else None))
     return [entry[1:] for entry in sorted(found, reverse=True)]
+
+
+def read_instruction(task_dir):
+    """The instruction in <task>/task.json, or None."""
+    try:
+        return json.loads((Path(task_dir) / "task.json").read_text()).get("instruction") or None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def default_instruction(name):
+    return re.sub(r"[_\s]+", " ", name).strip()
 
 
 def say(text, end="\n"):
@@ -91,21 +107,34 @@ def choose(root):
             return name
 
 
+def ask_instruction(root, name):
+    known = read_instruction(root / name)
+    if known:
+        say(f"Instruction: {known}")
+        return known
+    default = default_instruction(name)
+    return ask_line(f'Instruction for this task, one English sentence (Enter = "{default}"): ') or default
+
+
 def main():
     root = Path(os.getenv("OUT_DIR") or Path(__file__).resolve().parent / "data")
+    given = os.getenv("INSTRUCTION", "").strip()
     if os.getenv("TASK"):
         name = clean_name(os.environ["TASK"])
         if not name:
             sys.exit(f"✗ TASK={os.environ['TASK']!r} has no letter or digit")
+        instruction = given or read_instruction(root / name) or default_instruction(name)
     elif not sys.stdin.isatty():
         sys.exit("✗ No terminal to ask for the task: set TASK=<task name>")
     else:
         try:
             name = choose(root)
+            instruction = given or ask_instruction(root, name)
         except (KeyboardInterrupt, EOFError):
             say("\nCancelled")
             sys.exit(1)
     print(name)
+    print(instruction)
 
 
 if __name__ == "__main__":

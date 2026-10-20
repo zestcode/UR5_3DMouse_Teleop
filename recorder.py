@@ -13,22 +13,34 @@ HOME_AFTER_EPISODE=1: once a stopped episode is saved, `reset` puts the robot ba
 (gripper opened, then moveJ home); Space starts the next episode only after the ur5 state reports that reset done.
 The robot (`state` input, every ur5/state record) is kept for the whole run in robot.jsonl (unchanged JSON lines,
 raw evidence).
+VPP_CAMERAS set: each saved episode is also exported, in a background thread, to the VPP (Video Prediction Policy)
+dataset folder <task>/_vpp/ (vpp.py: 10 Hz steps, every camera at each step, state / action, the instruction);
+deleting the episode deletes its export too. Not for episodes ended by an error.
 
 OUT_DIR/<task>/
-  <NNN>_<label>/episode.json      task, run, start / end, per camera frame count + frame-number gaps
+  task.json                       the task's language instruction (INSTRUCTION, asked by task.py)
+  <NNN>_<label>/episode.json      task, run, instruction, start / end, per camera frame count + frame-number gaps
   <NNN>_<label>/<role>.mp4        RGB video (mp4v), frame i = row i of <role>_frames.csv
   <NNN>_<label>/<role>_frames.csv per frame: SDK frame number, timestamp + domain, host receive time, the frame
-                                  time on the host monotonic clock, and the TCP / flange pose at that time
+                                  time on the host monotonic clock, and the TCP / flange pose at that time, the
+                                  source of the frame time (sdk / receive)
   _runs/<run>/session.json        one teleop run (<run> = its start, YYYYmmdd_HHMMSS): cameras (serial, color
                                   intrinsics), settings, the episodes it recorded
   _runs/<run>/robot.jsonl         every ur5/state record of the run (t_ns = host CLOCK_MONOTONIC)
-Frame time: SDK global_time (host system clock, ms) -> monotonic via (time_ns - monotonic_ns) read at receive.
+  _vpp/                           the VPP export (vpp.py)
+Frame time: SDK global_time (host system clock, ms) -> monotonic via (time_ns - monotonic_ns) read at receive;
+when that is implausible against the host receive time (after it, or more than MAX_FRAME_LATENCY_MS before it:
+RealSense global time can run seconds off, seen 3.9 s ahead for a minute), receive time - the camera's median
+latency in the episode instead (frame_time_source = receive; timestamp_ms keeps the SDK value).
 Pose at frame time: linear (xyz) + slerp (rotation) between the two bracketing robot records; pose_valid=0 when
 the frame lies outside the robot records or the bracket is wider than MAX_POSE_GAP_MS.
 Poses: base frame, metres, quaternion x y z w (from the ur5 node's rot6d = first two rows of R).
-Env: TASK (task folder name), CAMERAS (role:serial,...), COLOR_W/COLOR_H/FPS, OUT_DIR, EPISODE_PLAN (labels, one
-per line), MAX_POSE_GAP_MS, MOCK_CAMERA=1 (synthetic frames, tests), START_RECORDING=1 (first episode starts by
-itself as soon as Space could start it, i.e. once the robot is ready; tests)."""
+Env: TASK (task folder name), INSTRUCTION (default: task.json, else the task name), CAMERAS (role:serial,...),
+COLOR_W/COLOR_H/FPS, OUT_DIR, EPISODE_PLAN (labels, one per line), MAX_POSE_GAP_MS, VPP_CAMERAS (roles in VPP camera
+order, '' = no export), VPP_FPS, VPP_SIZE, VPP_VAL_EVERY, MOCK_CAMERA=1 (synthetic frames, tests),
+START_RECORDING=1 (first episode starts by itself as soon as Space could start it, i.e. once the robot is ready;
+tests)."""
+import bisect
 import csv
 import json
 import os
@@ -42,9 +54,23 @@ import time
 import numpy as np
 import pyarrow as pa
 
+from task import default_instruction, read_instruction
+
 ROWS = ["index", "frame_number", "timestamp_ms", "timestamp_domain", "host_receive_mono_ns", "frame_mono_ns",
         "pose_valid", "pose_gap_ms", "tcp_x", "tcp_y", "tcp_z", "tcp_qx", "tcp_qy", "tcp_qz", "tcp_qw",
-        "flange_x", "flange_y", "flange_z", "flange_qx", "flange_qy", "flange_qz", "flange_qw"]
+        "flange_x", "flange_y", "flange_z", "flange_qx", "flange_qy", "flange_qz", "flange_qw", "frame_time_source"]
+MAX_FRAME_LATENCY_MS = 100  # SDK frame time to host receive: 10-18 ms measured on the D455s at 640 x 480
+
+
+def retime(frame_ns, receive_ns, max_latency_ns=MAX_FRAME_LATENCY_MS * 1e6):
+    """Frame times: the SDK one, unless implausible against the host receive time (after it, or more than
+    max_latency_ns before it); those get receive time - the median of the plausible latencies (0 if none).
+    -> (times int64, retimed bool per frame)."""
+    frame_ns, receive_ns = np.asarray(frame_ns, dtype=np.int64), np.asarray(receive_ns, dtype=np.int64)
+    latency = receive_ns - frame_ns
+    ok = (latency >= 0) & (latency <= max_latency_ns)
+    typical = int(np.median(latency[ok])) if ok.any() else 0
+    return np.where(ok, frame_ns, receive_ns - typical), ~ok
 
 
 def rot6d_to_mat(d6):
@@ -193,7 +219,7 @@ class Console:
 class Episode:
     """One episode directory; add() runs in the camera threads (one role per thread), close() in the node loop."""
 
-    def __init__(self, task, index, label, cameras, size, fps, run=None):
+    def __init__(self, task, index, label, cameras, size, fps, run=None, instruction=None):
         import cv2
         self.name = f"{index:03d}_{label}"
         self.path = task / self.name
@@ -205,7 +231,7 @@ class Episode:
                 raise RuntimeError(f"cannot open video writer for {role}")
         self.rows = {c.role: [] for c in cameras}
         self.info = {"name": self.name, "label": label, "index": index, "task": task.name, "run": run,
-                     "start_host_mono_ns": time.monotonic_ns(),
+                     "instruction": instruction, "start_host_mono_ns": time.monotonic_ns(),
                      "start_host_unix_ns": time.time_ns(), "completed": False}
         self.write_info()
 
@@ -223,7 +249,9 @@ class Episode:
         self.info.update(end_host_mono_ns=time.monotonic_ns(), end_host_unix_ns=time.time_ns(), end_reason=reason,
                          completed=True, cameras={})
         for role, rows in self.rows.items():
-            t = np.array([r["frame_mono_ns"] for r in rows], dtype=np.int64)
+            t, retimed = retime([r["frame_mono_ns"] for r in rows], [r["host_receive_mono_ns"] for r in rows])
+            for r, v in zip(rows, t.tolist()):
+                r["frame_mono_ns"] = v  # the VPP export reads it too
             ok, gap, tcp_xyz, tcp_q = interpolate(robot_t, robot_tcp, t, max_gap_ns)
             _, _, fl_xyz, fl_q = interpolate(robot_t, robot_flange, t, max_gap_ns)
             numbers = [r["frame_number"] for r in rows]
@@ -234,10 +262,12 @@ class Episode:
                     w.writerow([r["index"], r["frame_number"], f"{r['timestamp_ms']:.3f}", r["timestamp_domain"],
                                 r["host_receive_mono_ns"], r["frame_mono_ns"], int(ok[k]),
                                 "" if np.isnan(gap[k]) else f"{gap[k]:.3f}",
-                                *("" if np.isnan(v) else f"{v:.7f}" for v in (*tcp_xyz[k], *tcp_q[k], *fl_xyz[k], *fl_q[k]))])
+                                *("" if np.isnan(v) else f"{v:.7f}" for v in (*tcp_xyz[k], *tcp_q[k], *fl_xyz[k], *fl_q[k])),
+                                "receive" if retimed[k] else "sdk"])
             self.info["cameras"][role] = {
                 "frames": len(rows), "frames_with_pose": int(ok.sum()),
                 "frame_number_gaps": int(sum(b - a - 1 for a, b in zip(numbers, numbers[1:]) if b - a > 1)),
+                "frames_retimed": int(retimed.sum()),
                 "fps": (len(rows) - 1) / max((t[-1] - t[0]) / 1e9, 1e-9) if len(rows) > 1 else 0.}
         self.write_info()
         return self.info
@@ -299,6 +329,7 @@ class Camera:
 
 def main():
     from dora import Node
+    import vpp
     here = Path(__file__).resolve().parent
     mock = os.getenv("MOCK_CAMERA", "0") == "1"
     size = (int(os.getenv("COLOR_W", "640")), int(os.getenv("COLOR_H", "480")))
@@ -310,6 +341,11 @@ def main():
     if not cameras or "<" in cameras:
         raise ValueError("CAMERAS not configured: set it in teleop.local.env (copy teleop.local.env.example)")
     roles = [item.split(":") for item in cameras.split(",")]
+    vpp_cameras = [c for c in os.getenv("VPP_CAMERAS", "").split(",") if c]
+    if unknown := sorted(set(vpp_cameras) - {role for role, _ in roles}):
+        raise ValueError(f"VPP_CAMERAS {unknown}: not camera roles of CAMERAS ({cameras})")
+    vpp_fps, vpp_size = int(os.getenv("VPP_FPS", "10")), int(os.getenv("VPP_SIZE", "256"))
+    vpp_val_every = int(os.getenv("VPP_VAL_EVERY", "10"))
     root = Path(os.getenv("OUT_DIR", "data"))  # relative: next to this file
     root = root if root.is_absolute() else here / root
     task_name = os.getenv("TASK", "")
@@ -319,25 +355,34 @@ def main():
     run = time.strftime("%Y%m%d_%H%M%S") + ("_mock" if mock else "")
     run_dir = task / "_runs" / run
     run_dir.mkdir(parents=True, exist_ok=False)  # also creates a new task's folder
+    instruction = os.getenv("INSTRUCTION", "").strip() or read_instruction(task) or default_instruction(task_name)
+    (task / "task.json").write_text(json.dumps({"instruction": instruction}, indent=1))
+    vpp_root = task / "_vpp"
     count, last = last_episode(task)  # count = number of the task's last episode, of any run
     console = Console()
     node = Node()
     cams = [Camera(role, serial, size, fps, mock) for role, serial in roles]
-    meta = {"schema": "ur5-teleop-rgb-pose-v1", "task": task_name, "run": run, "simulated_camera": mock,
+    meta = {"schema": "ur5-teleop-rgb-pose-v1", "task": task_name, "run": run, "instruction": instruction,
+            "simulated_camera": mock,
             "start_host_mono_ns": time.monotonic_ns(),
             "start_host_unix_ns": time.time_ns(), "color": {"width": size[0], "height": size[1], "fps": fps,
                                                             "format": "bgr8", "video": "mp4v"},
             "cameras": {c.role: {"serial": c.serial, "color_intrinsics": c.intrinsics} for c in cams},
             "max_pose_gap_ms": max_gap_ns / 1e6, "episode_plan": plan, "episodes": [],
-            "timing": "frame_mono_ns = SDK global_time (host system clock) mapped to CLOCK_MONOTONIC at receive; "
-                      "robot t_ns = CLOCK_MONOTONIC; pose = interpolation of robot.jsonl at frame_mono_ns",
-            "env": {k: os.environ[k] for k in ("TASK", "CAMERAS", "COLOR_W", "COLOR_H", "FPS", "OUT_DIR", "EPISODE_PLAN",
-                                                "DRY_RUN", "MOCK_CAMERA", "MOCK_MOUSE") if k in os.environ}}
+            "vpp": {"cameras": vpp_cameras, "fps": vpp_fps, "size": vpp_size, "val_every": vpp_val_every,
+                    "folder": "_vpp"} if vpp_cameras else None,
+            "timing": "frame_mono_ns = SDK global_time (host system clock) mapped to CLOCK_MONOTONIC at receive "
+                      f"(implausible, i.e. after the receive or more than {MAX_FRAME_LATENCY_MS} ms before it: receive "
+                      "- median latency, frame_time_source = receive); robot t_ns = CLOCK_MONOTONIC; "
+                      "pose = interpolation of robot.jsonl at frame_mono_ns",
+            "env": {k: os.environ[k] for k in ("TASK", "INSTRUCTION", "CAMERAS", "COLOR_W", "COLOR_H", "FPS", "OUT_DIR",
+                                                "EPISODE_PLAN", "DRY_RUN", "MOCK_CAMERA", "MOCK_MOUSE") if k in os.environ}}
 
     def save_meta():
         (run_dir / "session.json").write_text(json.dumps(meta, indent=1, allow_nan=False))
     save_meta()
-    robot_t, robot_tcp, robot_flange = [], [], []
+    robot_t, robot_tcp, robot_flange, robot_target, robot_grip = [], [], [], [], []
+    exports = {}  # episode name -> its VPP export thread
     episode, end_reason, last_status = None, "stopped", 0
 
     def label(i):
@@ -351,7 +396,7 @@ def main():
 
     def start():
         nonlocal episode
-        episode = Episode(task, count + 1, label(count), cams, size, fps, run)
+        episode = Episode(task, count + 1, label(count), cams, size, fps, run, instruction)
         for c in cams:
             with c.lock:
                 c.episode = episode
@@ -373,9 +418,34 @@ def main():
         info = done.close(reason, np.array(robot_t, dtype=np.int64), np.array(robot_tcp), np.array(robot_flange),
                           max_gap_ns)
         secs = (info["end_host_mono_ns"] - info["start_host_mono_ns"]) / 1e9
-        parts = [f"{r} {c['frames']} frames ({c['frames_with_pose']} with pose, {c['frame_number_gaps']} dropped)"
+        parts = [f"{r} {c['frames']} frames ({c['frames_with_pose']} with pose, {c['frame_number_gaps']} dropped"
+                 + (f", {c['frames_retimed']} with an implausible SDK time" if c["frames_retimed"] else "") + ")"
                  for r, c in info["cameras"].items()]
         console.say(f"✓ {done.name} saved ({secs:.0f} s): " + ", ".join(parts))
+        if vpp_cameras:
+            export(done, reason)
+
+    def export(done, reason):
+        """VPP export of a saved episode, in a thread (it reads the videos back: seconds); the robot data of its time
+        span is copied here, in the node loop, which alone appends to it."""
+        times = {c: np.array([row["frame_mono_ns"] for row in done.rows[c]], dtype=np.int64) for c in vpp_cameras}
+        if reason == "error" or min(map(len, times.values())) < 2:
+            console.say(f"  VPP: {done.name} not exported ({'ended by an error' if reason == 'error' else 'no frames'})")
+            return
+        lo = bisect.bisect_left(robot_t, min(int(v[0]) for v in times.values()) - 1e9)
+        hi = bisect.bisect_right(robot_t, max(int(v[-1]) for v in times.values()) + 1e9)
+        robot = vpp.robot_arrays(robot_t[lo:hi], robot_tcp[lo:hi], robot_target[lo:hi], robot_grip[lo:hi])
+
+        def work():
+            try:
+                ann = vpp.export(vpp_root, done.path, vpp_cameras, times, robot, instruction, vpp_fps, vpp_size,
+                                 vpp_val_every, max_gap_ns, source={"task": task_name, "run": run})
+                where = ann["videos"][0]["video_path"].split("/")[1]
+                console.say(f"  VPP: {done.name} exported ({where} {ann['episode_id']}, {ann['video_length']} steps)")
+            except Exception as exc:  # the episode itself is saved; python vpp.py <task> exports it again
+                console.say(f"✗ VPP export of {done.name} failed: {exc!r}")
+        exports[done.name] = threading.Thread(target=work, daemon=True)
+        exports[done.name].start()
 
     pending = []  # (episode, reason, close at monotonic ns): wait for the robot records after the last frame
     resets, homing = 0, None  # reset requests sent; monotonic ns of the one the robot is still homing for
@@ -420,11 +490,14 @@ def main():
         while pending:  # stopped < 0.2 s ago: close it before removing it
             close(*pending.pop(0)[:2])
         meta_path = run_meta_path(path)  # read before the episode.json is gone
+        if (thread := exports.pop(path.name, None)) is not None:
+            thread.join()  # it reads the episode's videos
         try:
             shutil.rmtree(path)
         except OSError as exc:
             console.say(f"✗ Could not delete {path.name}: {exc}")
             return
+        vpp.remove(vpp_root, vpp.episode_number(path.name))  # also an export of an earlier run
         if path.name in meta["episodes"]:  # recorded in this run
             meta["episodes"].remove(path.name)
             save_meta()
@@ -456,6 +529,8 @@ def main():
                     robot_t.append(r["t_ns"])
                     robot_tcp.append(r["tcp_pose"])
                     robot_flange.append(r["flange_pose"])
+                    robot_target.append(r["target_pose"])
+                    robot_grip.append(vpp.gripper_values(r))
                     if homing is not None and r.get("reset_done", 0) >= resets:
                         homing, last_status = None, 0  # status line: Ready at the next tick
                         say_next()
@@ -519,6 +594,10 @@ def main():
                 pending.append((stop(), end_reason, 0))
             for done, reason, _ in pending:
                 finish(done, reason)
+            for name, thread in exports.items():
+                if thread.is_alive():
+                    console.say(f"  VPP: finishing the export of {name} ...")
+                    thread.join(timeout=120)
             for c in cams:
                 c.stop()
             meta["end_host_mono_ns"] = time.monotonic_ns()

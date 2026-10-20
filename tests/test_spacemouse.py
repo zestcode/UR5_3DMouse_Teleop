@@ -35,7 +35,7 @@ class Button:
 
 
 class NodeTests(unittest.TestCase):
-    def run_node(self, ticks):
+    def run_node(self, ticks, **extra_env):
         """ticks: per Dora tick, the spnav samples pending; "dead" = the daemon exits before that tick."""
         ours, daemon = socket.socketpair()
         pending = []
@@ -51,7 +51,7 @@ class NodeTests(unittest.TestCase):
                 pending[:] = samples
                 yield {"type": "INPUT", "id": "tick"}
             yield {"type": "STOP"}
-        env = {"MOCK_MOUSE": "0", "MOUSE_MAX": "250", "DEADZONE": "0.24"}
+        env = {"MOCK_MOUSE": "0", "MOUSE_MAX": "250", "DEADZONE": "0.24", **extra_env}
         try:
             with patch.dict(sys.modules, {"spnav": fake}), patch.dict(os.environ, env), \
                     patch.object(spacemouse, "Node", lambda: events()), \
@@ -73,6 +73,12 @@ class NodeTests(unittest.TestCase):
         self.assertTrue(all(a == [0, 0, .5, 0, 0, 0] for a in axes[:31]))  # held, never timed out
         self.assertTrue(all(a == [0] * 6 for a in axes[31:]))               # release: back in the deadzone
         self.assertTrue(all(p["enabled"] for name, p in self.sent if name == "command"))
+
+    def test_rotation_shaping_from_env(self):
+        # raw rx 162.5 of 250: deadzone .3 and square curve -> .25; with a .5 push on y, coupling 1 hides it.
+        axes = self.run_node([[Motion((0, 0, 0), (162.5, 0, 0))], [Motion((0, 155, 0), (162.5, 0, 0))]],
+                             ROTATION_DEADZONE="0.3", ROTATION_CURVE="2", ROTATION_COUPLING="1")
+        self.assertEqual([[round(v, 12) for v in a] for a in axes], [[0, 0, 0, 0, .25, 0], [0, 0, .5, 0, 0, 0]])
 
     def test_dead_daemon_ends_the_node(self):
         with self.assertRaisesRegex(RuntimeError, "spacenavd connection lost"):

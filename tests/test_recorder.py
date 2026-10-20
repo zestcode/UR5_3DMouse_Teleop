@@ -60,6 +60,19 @@ class TestInterpolate(unittest.TestCase):
         self.assertFalse(ok.any())
 
 
+class TestRetime(unittest.TestCase):
+    def test_implausible_sdk_times_take_receive_minus_median_latency(self):
+        receive = np.arange(8, dtype=np.int64) * 33_000_000 + 10**12
+        latency = np.array([15, 16, 14, -900, -2000, 15, 150, 100]) * 1_000_000  # ahead of receive; 150 ms old
+        t, retimed = r.retime(receive - latency, receive)
+        self.assertEqual(retimed.tolist(), [False, False, False, True, True, False, True, False])
+        np.testing.assert_array_equal(t[~retimed], (receive - latency)[~retimed])  # 100 ms: still plausible
+        np.testing.assert_array_equal(t[retimed], receive[retimed] - 15_000_000)  # median of 15 16 14 15 100
+        t, retimed = r.retime(receive + 1, receive)  # none plausible: receive times
+        self.assertTrue(retimed.all())
+        np.testing.assert_array_equal(t, receive)
+
+
 class TestPlan(unittest.TestCase):
     def test_labels(self):
         with tempfile.NamedTemporaryFile("w", suffix=".txt") as f:
@@ -144,6 +157,28 @@ class TestEpisode(unittest.TestCase):
             info = json.loads((Path(tmp) / "001_x" / "episode.json").read_text())
             self.assertTrue(info["completed"])
             self.assertEqual((info["task"], info["run"]), (Path(tmp).name, None))
+            self.assertEqual({x["frame_time_source"] for x in rows}, {"sdk"})
+
+    def test_frames_with_an_implausible_sdk_time_are_retimed(self):
+        class Cam:
+            role = "fixed"
+        with tempfile.TemporaryDirectory() as tmp:
+            ep = r.Episode(Path(tmp), 2, "x", [Cam()], (64, 48), 30, instruction="pick it up")
+            t0 = 1_000_000_000
+            for n in range(10):  # captured at t0 + n * 33.33 ms, received 15 ms later; frames 4-6: SDK 2 s ahead
+                t = t0 + n * 33_333_333
+                ep.add("fixed", np.zeros((48, 64, 3), np.uint8),
+                       {"frame_number": n, "timestamp_ms": 0., "timestamp_domain": "global_time",
+                        "host_receive_mono_ns": t + 15_000_000, "frame_mono_ns": t + 2_000_000_000 * (4 <= n <= 6)})
+            robot_t = t0 - 8_000_000 + np.arange(60, dtype=np.int64) * 8_000_000
+            pose = np.array([np.r_[[0, 0, k * .001], rot6d(np.eye(3))] for k in range(60)])
+            info = ep.close("stopped", robot_t, pose, pose, 50e6)
+            self.assertEqual((info["cameras"]["fixed"]["frames_retimed"], info["instruction"]), (3, "pick it up"))
+            rows = list(csv.DictReader((Path(tmp) / "002_x" / "fixed_frames.csv").open()))
+            self.assertEqual([x["frame_time_source"] for x in rows], ["sdk"] * 4 + ["receive"] * 3 + ["sdk"] * 3)
+            self.assertEqual([int(x["frame_mono_ns"]) for x in rows], [t0 + n * 33_333_333 for n in range(10)])
+            np.testing.assert_allclose([float(x["tcp_z"]) for x in rows],
+                                       [(n * 33.333333 + 8) / 8 * .001 for n in range(10)], atol=1e-7)
 
 
 if __name__ == "__main__":

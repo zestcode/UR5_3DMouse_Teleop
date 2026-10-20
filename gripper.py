@@ -4,8 +4,10 @@ Owned by the ur5 node so gripper action/feedback land in the same state record a
 the arm. A press starts opening/closing at a fixed speed; pressing the same button
 again stops (GTO 0). The firmware stops by itself on contact (OBJ 1 opening / 2
 closing, keeping FOR force) or at the end of travel (OBJ 3). `mode` is the commanded
-action and changes in the caller's thread; a background thread does the socket I/O
-so the RTDE loop never blocks on it.
+action and changes in the caller's thread; `target` the commanded position (0 open ..
+255 closed; None once stopped with the button: it stays where it is; a firmware stop
+keeps it: on an object the gripper still squeezes). A background thread does the socket
+I/O so the RTDE loop never blocks on it.
 """
 import queue
 import socket
@@ -72,6 +74,7 @@ class Gripper:
         self.stop_event = threading.Event()
         self.thread = None
         self.mode, self.pos, self.obj, self.t_ns = "stopped", None, None, None
+        self.target = None
         self.error = None
         # Auto-stop is trusted only once the latest press was sent, echoed (PRE) and 0.1 s old.
         self.seq = self.sent_seq = 0
@@ -113,6 +116,7 @@ class Gripper:
                 target = TARGET[button]
                 self.mode = MOVING[button]
                 command = f"SET POS {target} SPE {self.speed} FOR {self.force} GTO 1"
+            self.target = target
             self.commands.put((self.seq, command, target))
             return self.mode
 
@@ -152,7 +156,7 @@ class Gripper:
 
     def snapshot(self):
         with self.lock:
-            return {"mode": self.mode, "pos": self.pos, "obj": self.obj, "t_ns": self.t_ns}
+            return {"mode": self.mode, "pos": self.pos, "obj": self.obj, "t_ns": self.t_ns, "target": self.target}
 
     def close(self):
         self.stop_event.set()

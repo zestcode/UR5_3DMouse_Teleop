@@ -27,6 +27,9 @@ def main():
     mock_axes = os.getenv("MOCK_AXES", "") if mock else ""  # tests: the mock cap held at this deflection, enabled
     maximum = number("MOUSE_MAX", 300)
     deadzone = float(os.getenv("DEADZONE", "0.2"))
+    # Rotation deadzone, curve, coupling to translation (see map_motion); unset: rotation maps like translation.
+    shaping = (float(os.getenv("ROTATION_DEADZONE", str(deadzone))), number("ROTATION_CURVE", 1),
+               float(os.getenv("ROTATION_COUPLING", "0")))
     # Button press (edge) -> event; no enable button: pushing the cap moves the arm.
     presses = {int(os.getenv("GRIPPER_OPEN_BUTTON", "0")): ("gripper", "open"),
                int(os.getenv("GRIPPER_CLOSE_BUTTON", "1")): ("gripper", "close")}
@@ -35,7 +38,7 @@ def main():
         raise ValueError("Gripper open/close and record buttons must all differ")
     if record >= 0:
         presses[record] = ("record", None)
-    map_motion([0] * 6, maximum, deadzone)
+    map_motion([0] * 6, maximum, deadzone, *shaping)
     sock = None
     if not mock:
         import spnav
@@ -58,7 +61,7 @@ def main():
                         break
                     received = True
                     if isinstance(sample, spnav.SpnavMotionEvent):
-                        axes = map_motion(list(sample.translation) + list(sample.rotation), maximum, deadzone)
+                        axes = map_motion(list(sample.translation) + list(sample.rotation), maximum, deadzone, *shaping)
                     elif isinstance(sample, spnav.SpnavButtonEvent):
                         pressed = bool(sample.press)
                         if pressed and not buttons.get(sample.bnum, False) and sample.bnum in presses:

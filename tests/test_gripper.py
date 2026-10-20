@@ -22,9 +22,12 @@ class GripperTests(unittest.TestCase):
 
     def test_press_toggles_and_switches_direction(self):
         g = self.make()
+        self.assertIsNone(g.snapshot()["target"])
         self.assertEqual(g.press("close"), "closing")  # mode is the commanded action, immediately
+        self.assertEqual(g.snapshot()["target"], 255)  # and so is the target position
         self.assertTrue(wait_for(lambda: (g.snapshot()["pos"] or 0) > 20))
         self.assertEqual(g.press("close"), "stopped")
+        self.assertIsNone(g.snapshot()["target"])  # stopped with the button: holds where it is
         self.assertTrue(wait_for(lambda: self.fake.sent[-1] == "SET GTO 0"))
         self.assertEqual(self.fake.sent[0], "SET POS 255 SPE 200 FOR 100 GTO 1")
         self.assertEqual(g.press("close"), "closing")
@@ -36,11 +39,11 @@ class GripperTests(unittest.TestCase):
         g.press("close")
         self.assertTrue(wait_for(lambda: g.snapshot()["mode"] == "stopped"))
         snap = g.snapshot()
-        self.assertEqual((snap["pos"], snap["obj"]), (120, 2))  # gripped an object
+        self.assertEqual((snap["pos"], snap["obj"], snap["target"]), (120, 2, 255))  # gripped: still squeezing
         g.press("open")
         self.assertTrue(wait_for(lambda: g.snapshot()["mode"] == "stopped"))
         snap = g.snapshot()
-        self.assertEqual((snap["pos"], snap["obj"]), (0, 3))  # fully open
+        self.assertEqual((snap["pos"], snap["obj"], snap["target"]), (0, 3, 0))  # fully open
         self.assertIsNone(g.error)
 
     def test_open_never_toggles_to_stop(self):

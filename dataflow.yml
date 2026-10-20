@@ -1,7 +1,7 @@
 # General SpaceMouse teleop of the UR5 + RGB video of the D455 cameras with a pose per frame (recorder.py).
 # Started by teleop.sh. All nodes are in this directory.
 # From the shell (not set here: dora 0.3.8 lets a YAML value override the shell): ROBOT_IP, CAMERAS (teleop.local.env),
-# DRY_RUN, EPISODE_PLAN, OUT_DIR, TASK; MOCK_* tests only.
+# DRY_RUN, EPISODE_PLAN, OUT_DIR, TASK, INSTRUCTION; MOCK_* tests only.
 nodes:
   - id: spacemouse
     path: spacemouse.py
@@ -13,6 +13,10 @@ nodes:
     env:
       MOUSE_MAX: '250'
       DEADZONE: '0.24'
+      # Rotation only (translation keeps DEADZONE, linear):
+      ROTATION_DEADZONE: '0.3'
+      ROTATION_CURVE: '2'        # output = deflection^2: half a twist -> quarter speed, full twist -> MAX_ANGULAR_RAD_S
+      ROTATION_COUPLING: '0.5'   # while translating, the rotation deadzone grows by 0.5 x the translation output
       GRIPPER_OPEN_BUTTON: '0'   # left: press = open, press again = stop
       GRIPPER_CLOSE_BUTTON: '1'  # right: press = close until gripped/closed, press again = stop
 
@@ -96,3 +100,8 @@ nodes:
       COLOR_H: '480'
       FPS: '30'
       MAX_POSE_GAP_MS: '50'
+      # VPP export (vpp.py): each saved episode also goes to <task>/_vpp/, the dataset layout of Video Prediction Policy
+      VPP_CAMERAS: 'fixed,wrist'  # VPP camera order: 0 = rgb_static (third person), 1 = rgb_gripper; '' = no export
+      VPP_FPS: '10'               # VPP's video model predicts frames 0.1 s apart
+      VPP_SIZE: '256'             # square frames (wider than 4:3: padded first)
+      VPP_VAL_EVERY: '10'         # episode numbers divisible by 10 go to the val split

@@ -21,6 +21,25 @@ class TeleopTests(unittest.TestCase):
         np.testing.assert_allclose(x, [0, 0, 1 / 190, .5, 1, 1], atol=1e-12)
         self.assertAlmostEqual(map_motion([0, -155, 0, 0, 0, 0], 250, .24)[2], -.5)
 
+    def test_rotation_defaults_to_translation_mapping(self):
+        self.assertAlmostEqual(map_motion([0, 0, 0, 155, 0, 0], 250, .24)[4], .5)  # raw rx -> mapped axis 4
+
+    def test_rotation_deadzone_and_curve(self):
+        # MOUSE_MAX 250, rotation deadzone .3 (raw 75 is the edge), square curve; translation keeps .24, linear.
+        turn = [map_motion([0, 155, 0, raw, 0, 0], 250, .24, .3, 2)[[2, 4]] for raw in (75, 76, 162.5, 250, -162.5)]
+        np.testing.assert_allclose(turn, [[.5, 0], [.5, (.004 / .7) ** 2], [.5, .25], [.5, 1], [.5, -.25]], atol=1e-12)
+
+    def test_rotation_coupling_moves_the_edge_while_translating(self):
+        # Translation output .5, coupling .75: the rotation edge moves from .3 to .675 (raw 168.75), same slope.
+        turn = [map_motion([0, 155, 0, raw, 0, 0], 250, .24, .3, 2, .75)[4] for raw in (162.5, 168.75, 250)]
+        np.testing.assert_allclose(turn, [0, 0, (.325 / .7) ** 2], atol=1e-12)
+        self.assertAlmostEqual(map_motion([0, 0, 0, 250, 0, 0], 250, .24, .3, 2, .75)[4], 1)  # no push: full scale
+
+    def test_invalid_rotation_shaping(self):
+        for shaping in ((1, 2, 0), (-.1, 2, 0), (.3, 0, 0), (.3, float("nan"), 0), (.3, 2, -1), (.3, 2, float("inf"))):
+            with self.assertRaises(ValueError):
+                map_motion([0] * 6, 250, .24, *shaping)
+
     def test_smooth_twist(self):
         target, twist = np.r_[.08, 0, 0, 0, 0, .2], np.zeros(6)
         for _ in range(20):  # 20 steps of tau/20 = one time constant
