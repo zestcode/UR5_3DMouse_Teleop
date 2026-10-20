@@ -8,17 +8,19 @@
   latent_videos/<split>/<id>/<k>.pt         SVD VAE latents: not written here (vpp_latents.py, on a GPU machine)
 <id> = episode number (007_episode -> 7); <split> = val for every VAL_EVERY-th episode number, train otherwise.
 Steps: a uniform FPS grid (VPP: 0.1 s) over the time every camera recorded (and the robot: steps at the start or
-end without robot records are left out); per camera the frame nearest to each step; the robot interpolated there. Frames: padded to 4:3 if wider, resized to SIZE x SIZE (as VPP).
+end without robot records are left out); per camera the frame nearest to each step; the robot interpolated there.
+Frames: cropped to the camera's CROP box if it has one, padded to 4:3 if wider, resized to SIZE x SIZE (as VPP).
 state  (10) = TCP xyz (base frame, m) + TCP rot6d (first two rows of R) + gripper position (0 open .. 1 closed)
 action (10) = servo target xyz + rot6d (ur5 target_pose: where the SpaceMouse sent the robot) + gripper target
 VPP learns action - state (its x-bot dataset: actions[t .. t+n] - states[t]), so both are in one space. rot6d, not
 a quaternion: the TCP points down, qw is near 0, and a sign-canonical quaternion jumps between q and -q.
-The annotation also has keys VPP does not read: fps, cameras, state_layout, video_codec, source (episode, run, step
-times, the raw frame index of each step per camera, the largest frame-to-step offset).
+The annotation also has keys VPP does not read: fps, cameras, crop, state_layout, video_codec, source (episode, run,
+step times, the raw frame index of each step per camera, the largest frame-to-step offset).
 
 CLI, to (re-)export recorded episodes from their videos, CSVs and the run's robot.jsonl (e.g. other settings; frame
 times of older recordings are retimed here as the recorder now does, recorder.retime):
-  python vpp.py <task dir> [episode dir name ...] [--cameras fixed,wrist] [--fps 10] [--size 256] [--val-every 10]
+  python vpp.py <task dir> [episode dir name ...] [--cameras fixed,wrist] [--crop "fixed:150,100,500,450"] [--fps 10]
+                [--size 256] [--val-every 10]
 """
 import argparse
 import csv
@@ -34,6 +36,23 @@ from recorder import interpolate, retime
 from task import default_instruction, read_instruction
 
 STATE_LAYOUT = ["x", "y", "z", "r11", "r12", "r13", "r21", "r22", "r23", "gripper"]
+CROP = "fixed:150,100,500,450"  # the CLI default, as VPP_CROP in dataflow.yml: the table and the arm in the fixed view
+
+
+def parse_crops(text):
+    """'role:x0,y0,x1,y1 ...' (space-separated; '' = none) -> {role: (x0, y0, x1, y1)}: frame[y0:y1, x0:x1]
+    (pixels, x1 and y1 exclusive), as crop_region.ipynb shows them."""
+    crops = {}
+    for item in text.split():
+        role, _, box = item.partition(":")
+        try:
+            x0, y0, x1, y1 = map(int, box.split(","))
+        except ValueError:
+            raise ValueError(f"crop {item!r}: not role:x0,y0,x1,y1") from None
+        if not (role and 0 <= x0 < x1 and 0 <= y0 < y1) or role in crops:
+            raise ValueError(f"crop {item!r}: needs a new role and 0 <= x0 < x1, 0 <= y0 < y1")
+        crops[role] = (x0, y0, x1, y1)
+    return crops
 
 
 def episode_number(name):
@@ -107,10 +126,16 @@ def trajectory(robot, t, max_gap_ns):
             np.c_[target_xyz, quat_to_rot6d(target_q), grip[:, 1]][keep])
 
 
-def square(image, size):
-    """A camera image as VPP sees it: padded to 4:3 if wider (black bars above and below, as step1_prepare_latent.py),
-    then resized to size x size. Use the same on the live images when the policy runs."""
+def square(image, size, crop=None):
+    """A camera image as VPP sees it: cut to crop (x0, y0, x1, y1) if given, padded to 4:3 if wider (black bars above
+    and below, as step1_prepare_latent.py), then resized to size x size. Use the same on the live images when the
+    policy runs (the crop: the annotation's)."""
     import cv2
+    if crop is not None:
+        x0, y0, x1, y1 = crop
+        if x1 > image.shape[1] or y1 > image.shape[0]:
+            raise ValueError(f"crop {crop} outside the {image.shape[1]} x {image.shape[0]} frame")
+        image = image[y0:y1, x0:x1]
     h, w = image.shape[:2]
     pad = round(w * 3 / 4) - h
     if pad > 0:
@@ -173,7 +198,7 @@ class VideoWriter:
             raise RuntimeError(f"ffmpeg could not write {self.path.name}: {error}")
 
 
-def write_video(src, dst, frame_ids, size, fps):
+def write_video(src, dst, frame_ids, size, fps, crop=None):
     """Frames frame_ids (ascending, repeats allowed) of the video src -> video dst, each square()d; -> codec."""
     import cv2
     cap = cv2.VideoCapture(str(src))
@@ -188,7 +213,7 @@ def write_video(src, dst, frame_ids, size, fps):
                 if not ok:
                     raise RuntimeError(f"{src.name} has {index + 1} frames, frame {want} needed")
                 index += 1
-            out.write(square(image, size))
+            out.write(square(image, size, crop))
     finally:
         cap.release()
         out.close()
@@ -204,10 +229,14 @@ def remove(root, number):
 
 
 def export(root, episode, cameras, frame_times, robot, instruction, fps=10, size=256, val_every=10,
-           max_gap_ns=50e6, source=None):
+           max_gap_ns=50e6, source=None, crops=None):
     """Write the recorded episode directory `episode` into the VPP folder root; -> its annotation.
     cameras: roles in VPP camera order; frame_times[role]: frame_mono_ns of each frame of <role>.mp4 (its CSV rows);
-    robot: robot_arrays(). The annotation is written last (atomically): an export cut short stays invisible to VPP."""
+    robot: robot_arrays(); crops: parse_crops() (cameras without one: the whole frame). The annotation is written
+    last (atomically): an export cut short stays invisible to VPP."""
+    crops = crops or {}
+    if unknown := sorted(set(crops) - set(cameras)):
+        raise ValueError(f"crop for {unknown}: not among the cameras {list(cameras)}")
     number = episode_number(episode.name)
     split = split_of(number, val_every)
     t = grid([frame_times[c] for c in cameras], round(1e9 / fps))
@@ -223,14 +252,15 @@ def export(root, episode, cameras, frame_times, robot, instruction, fps=10, size
         (root / "annotation" / s).mkdir(parents=True, exist_ok=True)
     video_dir = root / "videos" / split / str(number)
     video_dir.mkdir(parents=True)
-    codecs = {write_video(episode / f"{c}.mp4", video_dir / f"{k}.mp4", picks[c], size, fps)
+    codecs = {write_video(episode / f"{c}.mp4", video_dir / f"{k}.mp4", picks[c], size, fps, crops.get(c))
               for k, c in enumerate(cameras)}
     ann = {"task": "robot_trajectory_prediction", "texts": [instruction],
            "videos": [{"video_path": f"videos/{split}/{number}/{k}.mp4"} for k in range(len(cameras))],
            "episode_id": number, "video_length": len(t),
            "latent_videos": [{"latent_video_path": f"latent_videos/{split}/{number}/{k}.pt"} for k in range(len(cameras))],
            "states": states.round(7).tolist(), "actions": actions.round(7).tolist(),
-           "fps": fps, "cameras": list(cameras), "state_layout": STATE_LAYOUT, "video_codec": "/".join(sorted(codecs)),
+           "fps": fps, "cameras": list(cameras), "crop": {c: list(crops[c]) for c in cameras if c in crops},
+           "state_layout": STATE_LAYOUT, "video_codec": "/".join(sorted(codecs)),
            "source": {"episode": episode.name, **(source or {}), "t_ns": t.tolist(),
                       "frame_index": {c: picks[c].tolist() for c in cameras},
                       "max_offset_ms": {c: round(float(np.abs(np.asarray(frame_times[c])[picks[c]] - t).max()) / 1e6, 3)
@@ -270,6 +300,8 @@ def main(argv=None):
     p.add_argument("episodes", nargs="*", help="episode folder names (default: every completed episode)")
     p.add_argument("--out", type=Path, help="VPP folder (default: <task>/_vpp)")
     p.add_argument("--cameras", default="fixed,wrist", help="camera roles in VPP order (0 = rgb_static)")
+    p.add_argument("--crop", default=CROP, help="'role:x0,y0,x1,y1 ...': frame[y0:y1, x0:x1] before the resize "
+                                                f"('' = whole frames; default {CROP})")
     p.add_argument("--fps", type=int, default=10)
     p.add_argument("--size", type=int, default=256)
     p.add_argument("--val-every", type=int, default=10)
@@ -277,6 +309,10 @@ def main(argv=None):
     p.add_argument("--instruction", help="default: the episode's, else the task's task.json, else the task name")
     args = p.parse_args(argv)
     task, cameras = args.task.resolve(), [c for c in args.cameras.split(",") if c]
+    try:
+        crops = parse_crops(args.crop)
+    except ValueError as exc:
+        p.error(str(exc))
     root = args.out or task / "_vpp"
     names = args.episodes or sorted(e.name for e in task.iterdir() if e.is_dir() and re.match(r"\d+_", e.name))
     failed = 0
@@ -287,13 +323,16 @@ def main(argv=None):
             if not info.get("completed") or info.get("end_reason") == "error":
                 print(f"{name}: skipped ({'ended by an error' if info.get('completed') else 'incomplete'})")
                 continue
+            if unknown := sorted(set(crops) - set(info.get("cameras", cameras))):
+                raise ValueError(f"crop for {unknown}: not cameras of the episode")
             times = {c: frame_times(episode / f"{c}_frames.csv") for c in cameras}
             robot = load_robot(task / "_runs" / info["run"] / "robot.jsonl",
                                min(int(v[0]) for v in times.values()) - 1e9, max(int(v[-1]) for v in times.values()) + 1e9)
             instruction = (args.instruction or info.get("instruction") or read_instruction(task)
                            or default_instruction(task.name))
             ann = export(root, episode, cameras, times, robot, instruction, args.fps, args.size, args.val_every,
-                         args.max_gap_ms * 1e6, source={"task": info["task"], "run": info["run"]})
+                         args.max_gap_ms * 1e6, source={"task": info["task"], "run": info["run"]},
+                         crops={c: crops[c] for c in cameras if c in crops})
         except (OSError, ValueError, KeyError, IndexError, RuntimeError) as exc:
             print(f"{name}: FAILED: {exc}")
             failed += 1

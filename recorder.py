@@ -37,9 +37,9 @@ the frame lies outside the robot records or the bracket is wider than MAX_POSE_G
 Poses: base frame, metres, quaternion x y z w (from the ur5 node's rot6d = first two rows of R).
 Env: TASK (task folder name), INSTRUCTION (default: task.json, else the task name), CAMERAS (role:serial,...),
 COLOR_W/COLOR_H/FPS, OUT_DIR, EPISODE_PLAN (labels, one per line), MAX_POSE_GAP_MS, VPP_CAMERAS (roles in VPP camera
-order, '' = no export), VPP_FPS, VPP_SIZE, VPP_VAL_EVERY, MOCK_CAMERA=1 (synthetic frames, tests),
-START_RECORDING=1 (first episode starts by itself as soon as Space could start it, i.e. once the robot is ready;
-tests)."""
+order, '' = no export), VPP_CROP (role:x0,y0,x1,y1 ..., vpp.parse_crops), VPP_FPS, VPP_SIZE, VPP_VAL_EVERY,
+MOCK_CAMERA=1 (synthetic frames, tests), START_RECORDING=1 (first episode starts by itself as soon as Space could
+start it, i.e. once the robot is ready; tests)."""
 import bisect
 import csv
 import json
@@ -344,6 +344,10 @@ def main():
     vpp_cameras = [c for c in os.getenv("VPP_CAMERAS", "").split(",") if c]
     if unknown := sorted(set(vpp_cameras) - {role for role, _ in roles}):
         raise ValueError(f"VPP_CAMERAS {unknown}: not camera roles of CAMERAS ({cameras})")
+    vpp_crops = vpp.parse_crops(os.getenv("VPP_CROP", ""))
+    if unknown := sorted(set(vpp_crops) - {role for role, _ in roles}):
+        raise ValueError(f"VPP_CROP {unknown}: not camera roles of CAMERAS ({cameras})")
+    vpp_crops = {c: box for c, box in vpp_crops.items() if c in vpp_cameras}
     vpp_fps, vpp_size = int(os.getenv("VPP_FPS", "10")), int(os.getenv("VPP_SIZE", "256"))
     vpp_val_every = int(os.getenv("VPP_VAL_EVERY", "10"))
     root = Path(os.getenv("OUT_DIR", "data"))  # relative: next to this file
@@ -369,8 +373,8 @@ def main():
                                                             "format": "bgr8", "video": "mp4v"},
             "cameras": {c.role: {"serial": c.serial, "color_intrinsics": c.intrinsics} for c in cams},
             "max_pose_gap_ms": max_gap_ns / 1e6, "episode_plan": plan, "episodes": [],
-            "vpp": {"cameras": vpp_cameras, "fps": vpp_fps, "size": vpp_size, "val_every": vpp_val_every,
-                    "folder": "_vpp"} if vpp_cameras else None,
+            "vpp": {"cameras": vpp_cameras, "crop": vpp_crops, "fps": vpp_fps, "size": vpp_size,
+                    "val_every": vpp_val_every, "folder": "_vpp"} if vpp_cameras else None,
             "timing": "frame_mono_ns = SDK global_time (host system clock) mapped to CLOCK_MONOTONIC at receive "
                       f"(implausible, i.e. after the receive or more than {MAX_FRAME_LATENCY_MS} ms before it: receive "
                       "- median latency, frame_time_source = receive); robot t_ns = CLOCK_MONOTONIC; "
@@ -439,7 +443,7 @@ def main():
         def work():
             try:
                 ann = vpp.export(vpp_root, done.path, vpp_cameras, times, robot, instruction, vpp_fps, vpp_size,
-                                 vpp_val_every, max_gap_ns, source={"task": task_name, "run": run})
+                                 vpp_val_every, max_gap_ns, source={"task": task_name, "run": run}, crops=vpp_crops)
                 where = ann["videos"][0]["video_path"].split("/")[1]
                 console.say(f"  VPP: {done.name} exported ({where} {ann['episode_id']}, {ann['video_length']} steps)")
             except Exception as exc:  # the episode itself is saved; python vpp.py <task> exports it again

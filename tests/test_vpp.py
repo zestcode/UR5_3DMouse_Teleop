@@ -1,6 +1,6 @@
 """UNIT tests of vpp.py (the VPP export) and vpp_preview.py on their own, with synthetic data (no Dora, no cameras,
 no robot): step grid and nearest frames, rotation and gripper conversion, state / action interpolation against
-analytic values, frame padding, one episode exported from synthetic videos (which raw frame lands at each step, the
+analytic values, crop boxes and frame cropping / padding, one episode exported from synthetic videos (which raw frame lands at each step, the
 annotation, H.264 and the mp4v fallback), removal, reading a run's robot.jsonl, the CLI on a synthetic task folder,
 and the side-by-side preview."""
 import contextlib
@@ -57,8 +57,9 @@ def write_video(path, n, size=(640, 480)):
     out.release()
 
 
-def frame_ids(path):
-    """The frame number shown by each frame of a write_video() video (also after vpp.square)."""
+def frame_ids(path, stripes=6):
+    """The frame number shown by each frame of a write_video() video (also after vpp.square); stripes < 6: of a crop
+    that kept only the first `stripes` stripes, the number modulo 2 ** stripes."""
     cap = cv2.VideoCapture(str(path))
     ids = []
     while True:
@@ -66,7 +67,7 @@ def frame_ids(path):
         if not ok:
             return ids
         w = image.shape[1]
-        ids.append(sum(1 << b for b in range(6) if image[:, (2 * b + 1) * w // 12].mean() > 128))
+        ids.append(sum(1 << b for b in range(stripes) if image[:, (2 * b + 1) * w // (2 * stripes)].mean() > 128))
 
 
 def make_episode(root, name="010_episode"):
@@ -148,6 +149,29 @@ class TestConversions(unittest.TestCase):
         self.assertEqual(out[40:216].min(), 200)
         self.assertEqual(vpp.square(np.full((480, 640, 3), 7, np.uint8), 256).min(), 7)  # 4:3: no bars
 
+    def test_parse_crops(self):
+        self.assertEqual(vpp.parse_crops(""), {})
+        self.assertEqual(vpp.parse_crops(vpp.CROP), {"fixed": (150, 100, 500, 450)})
+        self.assertEqual(vpp.parse_crops(" fixed:150,100,500,450  wrist:0,0,64,48 "),
+                         {"fixed": (150, 100, 500, 450), "wrist": (0, 0, 64, 48)})
+        for bad in ("fixed", "fixed:1,2,3", "fixed:a,0,1,1", ":0,0,1,1", "fixed:5,0,5,1", "fixed:0,9,1,2",
+                    "fixed:-1,0,1,1", "fixed:0,0,1,1 fixed:0,0,2,2"):
+            with self.assertRaises(ValueError, msg=bad):
+                vpp.parse_crops(bad)
+
+    def test_square_crops_before_resizing(self):
+        image = np.zeros((480, 640, 3), np.uint8)
+        image[100:450, 150:500] = 200  # the box
+        image[100:450, 150] = 90  # its first column
+        out = vpp.square(image, 350, (150, 100, 500, 450))  # 350 x 350: cut, no resampling
+        self.assertEqual(out.shape, (350, 350, 3))
+        self.assertTrue((out[:, 0] == 90).all() and (out[:, 1:] == 200).all())
+        self.assertGreaterEqual(vpp.square(image, 256, (150, 100, 500, 450)).min(), 90)  # nothing from outside (0)
+        wide = vpp.square(np.full((480, 640, 3), 200, np.uint8), 256, (0, 0, 640, 240))  # 8:3: padded to 4:3
+        self.assertEqual((wide[:50].max(), wide[80:176].min()), (0, 200))  # 120 of 480 rows black on top -> 64
+        with self.assertRaisesRegex(ValueError, "outside the 640 x 480 frame"):
+            vpp.square(image, 256, (0, 0, 641, 480))
+
 
 class TestExport(unittest.TestCase):
     def test_export_writes_the_vpp_layout(self):
@@ -199,6 +223,23 @@ class TestExport(unittest.TestCase):
             vpp.remove(root, 3)
             self.assertEqual([p for p in root.rglob("*") if p.is_file()], [])
             vpp.remove(root, 3)  # nothing there: fine
+
+    def test_export_crops_a_camera(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            episode, times = make_episode(Path(tmp))
+            root = Path(tmp) / "_vpp"
+            ann = vpp.export(root, episode, ["fixed", "wrist"], times, robot(), "x", crops={"fixed": (0, 40, 320, 400)})
+            self.assertEqual(ann["crop"], {"fixed": [0, 40, 320, 400]})
+            picked = ann["source"]["frame_index"]
+            cap = cv2.VideoCapture(str(root / ann["videos"][0]["video_path"]))
+            self.assertEqual((cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), (256, 256))
+            # fixed kept the left half: stripes 0 .. 2 fill the frame; wrist: all six
+            self.assertEqual(frame_ids(root / ann["videos"][0]["video_path"], 3), [i % 8 for i in picked["fixed"]])
+            self.assertEqual(frame_ids(root / ann["videos"][1]["video_path"]), picked["wrist"])
+            with self.assertRaisesRegex(ValueError, r"crop for \['top'\]: not among the cameras"):
+                vpp.export(root, episode, ["fixed", "wrist"], times, robot(), "x", crops={"top": (0, 0, 1, 1)})
+            with self.assertRaisesRegex(ValueError, "outside the 640 x 480 frame"):
+                vpp.export(root, episode, ["fixed", "wrist"], times, robot(), "x", crops={"wrist": (0, 0, 640, 481)})
 
     def test_cameras_that_never_overlap_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -278,12 +319,20 @@ class TestRunFiles(unittest.TestCase):
             self.assertIn("002_episode: skipped (incomplete)", out.getvalue())
             ann = json.loads((task / "_vpp/annotation/train/1.json").read_text())
             self.assertEqual((ann["texts"], ann["video_length"], ann["source"]["run"]), (["pick up the cup"], 15, "run1"))
+            self.assertEqual(ann["crop"], {"fixed": [150, 100, 500, 450]})  # the default, vpp.CROP
             self.assertEqual(np.array(ann["actions"])[:, 9].tolist(), [0.] * 4 + [1.] * 11)  # steps from 413 ms
             with contextlib.redirect_stdout(out):
                 self.assertEqual(vpp.main([str(task), "001_episode", "--instruction", "lift the cup",
                                            "--out", str(Path(tmp) / "elsewhere")]), 0)
             self.assertEqual(json.loads((Path(tmp) / "elsewhere/annotation/train/1.json").read_text())["texts"],
                              ["lift the cup"])
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(vpp.main([str(task), "001_episode", "--crop", ""]), 0)
+                self.assertEqual(vpp.main([str(task), "001_episode", "--crop", "top:0,0,1,1"]), 1)
+            self.assertIn("001_episode: FAILED: crop for ['top']: not cameras of the episode", out.getvalue())
+            self.assertEqual(json.loads((task / "_vpp/annotation/train/1.json").read_text())["crop"], {})
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                vpp.main([str(task), "--crop", "fixed:1,2,3"])
 
 
 if __name__ == "__main__":

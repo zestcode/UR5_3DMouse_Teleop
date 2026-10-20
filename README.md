@@ -115,7 +115,7 @@ seconds; `VPP: <episode> exported` on the terminal) to `<task>/_vpp/`, in the la
 ```
 <task>/_vpp/
   annotation/{train,val}/<id>.json    texts, videos, latent_videos, episode_id, video_length, states, actions
-  videos/{train,val}/<id>/0.mp4       fixed camera (VPP rgb_static), 256 x 256, 10 fps, H.264
+  videos/{train,val}/<id>/0.mp4       fixed camera (VPP rgb_static), cropped (VPP_CROP), 256 x 256, 10 fps, H.264
   videos/{train,val}/<id>/1.mp4       wrist camera (VPP rgb_gripper)
   latent_videos/{train,val}/<id>/<k>.pt   SVD VAE latents: written by vpp_latents.py (below)
   preview/<id>.mp4                    optional, vpp_preview.py: both cameras side by side (not read by VPP)
@@ -137,11 +137,17 @@ number (its CSV row) and the gripper position / target, in real time (10 fps).
   closed). `actions` (10): the servo target pose the SpaceMouse commanded (xyz + rot6d) and the gripper target
   (1 closing or holding an object, 0 opening, its position when stopped with the button). VPP trains on
   `actions[t..t+n] - states[t]`, so both are in the same space. When the policy runs, send the predicted target
-  pose with servoL as the ur5 node does, and prepare the camera images with `vpp.square()` (the same resize).
+  pose with servoL as the ur5 node does, and prepare the camera images with `vpp.square(image, 256, crop)`, with
+  `crop` from the annotation's `crop` for that camera (none: the whole frame), so they get the same crop and resize.
+- Crop: `VPP_CROP` (`role:x0,y0,x1,y1 ...`, i.e. `frame[y0:y1, x0:x1]` in pixels of the 640 x 480 frame, x1 and
+  y1 exclusive) cuts a camera's frames before the pad and resize; default `fixed:150,100,500,450`, a 350 x 350 box
+  around the table and the arm. A square box is not distorted by the square resize. To choose one: open
+  `crop_region.ipynb`, set its video and box, and check the box on frames across the episode.
 - Settings: `VPP_*` in the `recorder` node of `dataflow.yml` (`VPP_CAMERAS: ''` turns the export off). Deleting an
   episode (d, y) deletes its export too. Episodes that ended by an error are not exported.
 - Re-export (other settings, a corrected instruction, or episodes recorded before the export existed):
-  `python vpp.py OUT_DIR/<task> [episode names] [--instruction "..."] [--val-every 10] [--out DIR]`.
+  `python vpp.py OUT_DIR/<task> [episode names] [--instruction "..."] [--crop "fixed:150,100,500,450"]
+  [--val-every 10] [--out DIR]` (`--crop ''`: whole frames). A re-export also deletes the episode's latents.
 
 Then, on the GPU machine, in VPP's own Python environment:
 

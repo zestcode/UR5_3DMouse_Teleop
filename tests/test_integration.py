@@ -82,6 +82,7 @@ class TestDataflow(unittest.TestCase):
             vpp = task / "_vpp"
             ann = json.loads((vpp / "annotation" / "train" / "1.json").read_text())
             self.assertEqual((ann["texts"], ann["episode_id"], ann["cameras"]), (["t"], 1, ["fixed", "wrist"]))
+            self.assertEqual((ann["crop"], meta["vpp"]["crop"]), ({"fixed": [150, 100, 500, 450]},) * 2)  # dataflow.yml
             self.assertGreater(ann["video_length"], 80)  # ~10 s at 10 Hz
             n = ann["video_length"]
             self.assertEqual((np.shape(ann["states"]), np.shape(ann["actions"])), ((n, 10), (n, 10)))

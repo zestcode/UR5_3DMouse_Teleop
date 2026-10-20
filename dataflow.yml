@@ -102,6 +102,7 @@ nodes:
       MAX_POSE_GAP_MS: '50'
       # VPP export (vpp.py): each saved episode also goes to <task>/_vpp/, the dataset layout of Video Prediction Policy
       VPP_CAMERAS: 'fixed,wrist'  # VPP camera order: 0 = rgb_static (third person), 1 = rgb_gripper; '' = no export
+      VPP_CROP: 'fixed:150,100,500,450'  # role:x0,y0,x1,y1 (frame[y0:y1, x0:x1], before the resize; crop_region.ipynb)
       VPP_FPS: '10'               # VPP's video model predicts frames 0.1 s apart
       VPP_SIZE: '256'             # square frames (wider than 4:3: padded first)
       VPP_VAL_EVERY: '10'         # episode numbers divisible by 10 go to the val split
