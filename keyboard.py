@@ -5,6 +5,8 @@ Esc -> `esc` output (ur5 returns home, then stops the dataflow), then the node e
 RECORD_KEY=1: Space -> `record` output (start / stop an episode; declare the output in the graph).
 DELETE_KEY=1: d -> `delete` output "ask" (delete the last episode?); the next key answers it: y -> "yes",
 any other key -> "no" (that key still does its own action, e.g. Space still records).
+STEP_KEY=1: Enter -> `step` output: the end of the current step of a multi-step task, value = the host
+CLOCK_MONOTONIC ns at which the key was read.
 While running, the node holds the terminal foreground in cbreak mode (typing is not
 echoed), so Ctrl-C reaches this node; it forwards it to `dora run` = stop without homing.
 The terminal is restored on exit; if it is ever left in a bad state, run `stty sane`.
@@ -47,6 +49,11 @@ def delete_keys(data, asked):
     return answers, asked
 
 
+def enter_keys(data):
+    """-> number of Enter presses in data: \n (cbreak keeps ICRNL), \r without ICRNL, \r\n once."""
+    return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").count(b"\n")
+
+
 class Terminal:
     """The controlling terminal in cbreak mode, with this node's process group in front."""
 
@@ -75,6 +82,7 @@ def main():
     record_key = os.getenv("RECORD_KEY", "0") == "1"
     home_key = os.getenv("HOME_KEY", "0") == "1"  # h -> `home` output
     delete_key = os.getenv("DELETE_KEY", "0") == "1"  # d, then y -> `delete` output
+    step_key = os.getenv("STEP_KEY", "0") == "1"  # Enter -> `step` output
     node = Node()
     try:
         term = Terminal()
@@ -91,7 +99,8 @@ def main():
         signal.signal(signal.SIGTSTP, signal.SIG_IGN)
         print("[Keyboard] Esc (in this terminal) = return home and stop all nodes; "
               "Ctrl-C = stop without homing" + ("; Space = start/stop an episode" if record_key else "") + ("; h = home" if home_key else "")
-              + ("; d then y = delete the last episode" if delete_key else ""), flush=True)
+              + ("; d then y = delete the last episode" if delete_key else "")
+              + ("; Enter = end of a step" if step_key else ""), flush=True)
     pending, esc_at, asked = b"", None, False
     try:
         for event in node:
@@ -100,12 +109,15 @@ def main():
             if term is None or event["type"] != "INPUT":
                 continue
             data = term.read()
+            read_ns = time.monotonic_ns()
             if delete_key:  # before `record`: a Space after d first answers "no"
                 answers, asked = delete_keys(data, asked)
                 for answer in answers:
                     node.send_output("delete", pa.array([answer]))
             for _ in range(data.count(b" ") if record_key else 0):
                 node.send_output("record", pa.array([0]))
+            for _ in range(enter_keys(data) if step_key else 0):
+                node.send_output("step", pa.array([read_ns]))
             if home_key and (b"h" in data or b"H" in data):
                 node.send_output("home", pa.array([0]))
             pending, esc_at, pressed = lone_esc(pending, data, esc_at, time.monotonic())

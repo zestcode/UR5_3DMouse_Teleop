@@ -1,7 +1,7 @@
 # General SpaceMouse teleop of the UR5 + RGB video of the D455 cameras with a pose per frame (recorder.py).
 # Started by teleop.sh. All nodes are in this directory.
 # From the shell (not set here: dora 0.3.8 lets a YAML value override the shell): ROBOT_IP, CAMERAS (teleop.local.env),
-# DRY_RUN, EPISODE_PLAN, OUT_DIR, TASK, INSTRUCTION; MOCK_* tests only.
+# DRY_RUN, EPISODE_PLAN, OUT_DIR, TASK, INSTRUCTION, STEPS; MOCK_* tests only.
 nodes:
   - id: spacemouse
     path: spacemouse.py
@@ -21,16 +21,17 @@ nodes:
       GRIPPER_CLOSE_BUTTON: '1'  # right: press = close until gripped/closed, press again = stop
 
   - id: keyboard
-    path: keyboard.py  # Esc: home + stop; Ctrl-C: stop; Space; h; d then y
+    path: keyboard.py  # Esc: home + stop; Ctrl-C: stop; Space; h; d then y; Enter
     inputs:
       tick:
         source: dora/timer/millis/5
         queue_size: 1
-    outputs: [esc, record, home, delete]
+    outputs: [esc, record, home, delete, step]
     env:
       RECORD_KEY: '1'
       HOME_KEY: '1'
       DELETE_KEY: '1'
+      STEP_KEY: '1'
 
   - id: ur5
     path: ur5.py
@@ -57,7 +58,7 @@ nodes:
     env:
       CONTROL_HZ: '125'
       MAX_LINEAR_M_S: '0.08'
-      MAX_ANGULAR_RAD_S: '0.2'
+      MAX_ANGULAR_RAD_S: '0.25'
       SERVO_LOOKAHEAD_S: '0.1'
       SERVO_GAIN: '300'
       LEASH_M: '0.03'
@@ -93,9 +94,14 @@ nodes:
       delete:
         source: keyboard/delete
         queue_size: 16
+      step:
+        source: keyboard/step  # Enter: the end of the current step of a multi-step task (STEPS)
+        queue_size: 16
     outputs: [heartbeat, reset]
     env:
       HOME_AFTER_EPISODE: '1'  # after each saved episode: gripper open + robot home; Space waits until done
+      CAMERA_FAIL_S: '1'       # a camera without frames for 1 s during an episode: deleted, robot reset, camera restarted
+      CAMERA_GIVE_UP_S: '30'   # still without frames 30 s after it stopped: the run ends (the robot is home)
       COLOR_W: '640'
       COLOR_H: '480'
       FPS: '30'

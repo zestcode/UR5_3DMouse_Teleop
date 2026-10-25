@@ -6,8 +6,14 @@ its task question, all with mock mouse, mock cameras and DRY_RUN=1 (no robot).
 - keys typed into a pseudo-terminal (the dataflow's controlling terminal): Space records, d then y deletes (the
   VPP export too), d then another key keeps; after each episode the robot is reset (gripper open, home); a restart continues the task;
   the (mock) SpaceMouse moves the robot only while an episode is recorded.
-- teleop.sh: n + a task name + its instruction starts that task folder at 001; a restart with e continues it
-  without asking the instruction again."""
+- a camera that stops during an episode (MOCK_CAMERA_FAIL): the episode is deleted, the robot reset (gripper open,
+  home), the camera restarted, and the next episode takes the number again; a camera that cannot be restarted ends
+  the run (dora exits) once the robot is home.
+- steps (STEPS): each Enter ends a step, the last one stops the episode; episode.json has the time of each Enter and
+  the VPP export the segments between them (segments.json too); Space before the last step saves the episode
+  without segments; in a task without steps Enter does not stop it.
+- teleop.sh: n + a task name + its instruction + its steps starts that task folder at 001; a restart with e
+  continues it without asking the instruction or the steps again."""
 import csv
 import json
 import os
@@ -78,7 +84,7 @@ class TestDataflow(unittest.TestCase):
                 valid = sum(int(x["pose_valid"]) for x in rows)
                 self.assertGreaterEqual(valid, len(rows) - 2)  # the last frames may follow the last robot record
             self.assertEqual((info["instruction"], meta["instruction"]), ("t", "t"))  # default: the task name
-            self.assertEqual(json.loads((task / "task.json").read_text()), {"instruction": "t"})
+            self.assertEqual(json.loads((task / "task.json").read_text()), {"instruction": "t", "steps": []})
             vpp = task / "_vpp"
             ann = json.loads((vpp / "annotation" / "train" / "1.json").read_text())
             self.assertEqual((ann["texts"], ann["episode_id"], ann["cameras"]), (["t"], 1, ["fixed", "wrist"]))
@@ -194,6 +200,127 @@ class TestDataflow(unittest.TestCase):
             self.assertEqual(len(set(x(after))), 1)  # after the episode: locked again
             self.assertTrue(all(r["hard_stop"] and not r["recording"] for r in after))
 
+    def test_enter_ends_each_step_and_the_last_one_stops(self):
+        with tempfile.TemporaryDirectory() as tmp, open(Path(tmp) / "dora.log", "w") as log:
+            run = dora(mock_env(tmp, STEPS="open pick place"), tmp, log)
+            task = Path(tmp) / "t"
+            try:
+                at = run.wait_for("Ready: press Space")
+                run.key(b"\n")
+                at = run.wait_for("Enter ends a step only while recording", at)
+                run.key(b" ")
+                at = run.wait_for("Recording 001_episode: step 1/3 open", at)
+                for now in ("2/3 pick", "3/3 place"):
+                    time.sleep(1)
+                    run.key(b"\n")
+                    at = run.wait_for(f"now step {now}", at)
+                time.sleep(1)
+                run.key(b"\n")  # the end of the last step stops the episode
+                at = run.wait_for("001_episode saved (", at)
+                at = run.wait_for("3/3 steps)", at)
+                run.wait_for("VPP: 001_episode exported", at)  # in a thread: before or after Next
+                at = run.wait_for("Next: 002_episode", at)
+                run.key(b" ")
+                at = run.wait_for("Recording 002_episode", at)
+                time.sleep(1)
+                run.key(b"\n")
+                at = run.wait_for("now step 2/3 pick", at)
+                time.sleep(1)
+                run.key(b" ")  # Space after one of the three steps: saved, without segments
+                at = run.wait_for("002_episode saved (", at)
+                at = run.wait_for("1/3 steps: no segments)", at)
+                run.wait_for("VPP: 002_episode exported", at)
+            finally:
+                run.stop()
+            steps = ["open", "pick", "place"]
+            self.assertEqual(json.loads((task / "task.json").read_text()), {"instruction": "t", "steps": steps})
+            first = json.loads((task / "001_episode" / "episode.json").read_text())
+            ends = first["step_end_host_mono_ns"]
+            self.assertEqual((first["steps"], len(ends)), (steps, 3))
+            self.assertTrue(all(d > 0.95e9 for d in np.diff([first["start_host_mono_ns"], *ends])))  # 1 s apart
+            for role in ("wrist", "fixed"):
+                with (task / "001_episode" / f"{role}_frames.csv").open() as f:
+                    last = int(list(csv.DictReader(f))[-1]["host_receive_mono_ns"])
+                self.assertLess(abs(last - ends[-1]), 1e8)  # the recording stopped at the last Enter
+            ann = json.loads((task / "_vpp" / "annotation" / "train" / "1.json").read_text())
+            segs, t = ann["segments"], ann["source"]["t_ns"]
+            self.assertEqual([s["primary_action_verb"] for s in segs], steps)
+            self.assertEqual((segs[0]["start_frame"], segs[-1]["end_frame"]), (0, ann["video_length"] - 1))
+            for a, b in zip(segs, segs[1:]):
+                self.assertEqual(b["start_frame"], a["end_frame"] + 1)  # contiguous
+            for seg, end in zip(segs[:-1], ends):
+                self.assertTrue(t[seg["end_frame"]] <= end < t[seg["end_frame"] + 1])  # cut at the Enter
+            self.assertEqual(json.loads((task / "_vpp" / "segments.json").read_text()),
+                             {"1": {"all_frames": ann["video_length"], "segments": segs}})
+            second = json.loads((task / "002_episode" / "episode.json").read_text())
+            self.assertEqual((second["steps"], len(second["step_end_host_mono_ns"])), (steps, 1))
+            self.assertNotIn("segments", json.loads((task / "_vpp" / "annotation" / "train" / "2.json").read_text()))
+
+    def test_enter_in_a_task_without_steps_does_not_stop(self):
+        with tempfile.TemporaryDirectory() as tmp, open(Path(tmp) / "dora.log", "w") as log:
+            run = dora(mock_env(tmp), tmp, log)
+            task = Path(tmp) / "t"
+            try:
+                at = run.wait_for("Ready: press Space")
+                run.key(b" ")
+                at = run.wait_for("Recording 001_episode", at)
+                run.key(b"\n")
+                at = run.wait_for("Task t has no steps: Space stops the episode", at)
+                time.sleep(1)
+                self.assertNotIn(b"001_episode saved", run.out)
+                run.key(b" ")
+                at = run.wait_for("001_episode saved (", at)
+                run.wait_for("VPP: 001_episode exported", at)
+            finally:
+                run.stop()
+            info = json.loads((task / "001_episode" / "episode.json").read_text())
+            self.assertEqual((info["steps"], info["step_end_host_mono_ns"]), ([], []))
+            self.assertNotIn("segments", json.loads((task / "_vpp" / "annotation" / "train" / "1.json").read_text()))
+            self.assertFalse((task / "_vpp" / "segments.json").exists())
+
+    def test_camera_failure_deletes_the_episode_resets_and_continues(self):
+        with tempfile.TemporaryDirectory() as tmp, open(Path(tmp) / "dora.log", "w") as log:
+            run = dora(mock_env(tmp, MOCK_CAMERA_FAIL="wrist:1.5"), tmp, log)  # no frames 1.5 s into the episode
+            task = Path(tmp) / "t"
+            try:
+                at = run.wait_for("Ready: press Space")
+                meta_file = next((task / "_runs").glob("*/session.json"))
+                run.key(b" ")
+                at = run.wait_for("Recording 001_episode", at)
+                at = run.wait_for("✗ wrist camera: no frame for 1 s, 001_episode deleted", at)
+                self.assertFalse((task / "001_episode").exists())
+                self.assertEqual(json.loads(meta_file.read_text())["episodes"], [])
+                at = run.wait_for("Reset for the next episode: opening the gripper, returning home", at)
+                run.wait_for("Next: 001_episode", at)  # the number is free again
+                at = run.wait_for("wrist camera delivers frames again", at)  # restarted by its thread
+                at = record(run, "001_episode", at)
+                run.wait_for("Next: 002_episode", at)  # its reset is done
+            finally:
+                run.stop()
+            self.assertEqual(json.loads(meta_file.read_text())["episodes"], ["001_episode"])
+            self.assertEqual(episode_dirs(task), ["001_episode"])
+            text = (Path(tmp) / "dora.log").read_text()
+            self.assertEqual(text.count("Opening the gripper"), 3)  # start-up, the failure, the saved episode
+            self.assertEqual(text.count("DRY reset: would moveJ home"), 2)
+
+    def test_camera_that_cannot_be_restarted_ends_the_run_once_home(self):
+        with tempfile.TemporaryDirectory() as tmp, open(Path(tmp) / "dora.log", "w") as log:
+            run = dora(mock_env(tmp, MOCK_CAMERA_FAIL="wrist:1:dead"), tmp, log)
+            task = Path(tmp) / "t"
+            try:
+                at = run.wait_for("Ready: press Space")
+                run.key(b" ")
+                at = run.wait_for("Recording 001_episode", at)
+                at = run.wait_for("001_episode deleted", at)
+                at = run.wait_for("ending the run", at, timeout=60)  # CAMERA_GIVE_UP_S (30 s) after it stopped
+                status = run.proc.wait(timeout=60)  # the whole dataflow stops: nothing left hanging
+            finally:
+                run.stop()
+            self.assertNotEqual(status, 0)
+            self.assertEqual(episode_dirs(task), [])
+            text = (Path(tmp) / "dora.log").read_text()
+            self.assertLess(text.index("DRY reset: would moveJ home"), text.index("ending the run"))
+
     def test_restart_continues_the_task(self):
         with tempfile.TemporaryDirectory() as tmp, open(Path(tmp) / "dora.log", "w") as log:
             task = Path(tmp) / "t"
@@ -242,7 +369,10 @@ class TestDataflow(unittest.TestCase):
                 at = first.wait_for("folder name: pick_cup", at)
                 at = first.wait_for('Instruction for this task, one English sentence (Enter = "pick cup"): ', at)
                 first.key(b"pick up the cup\n")
+                at = first.wait_for("Steps of this task, verbs in order", at)
+                first.key(b"pick place\n")
                 at = first.wait_for("Instruction: pick up the cup", at)
+                at = first.wait_for("Steps: pick -> place", at)
                 at = first.wait_for("Task pick_cup: no episodes yet", at)
                 at = first.wait_for("Ready: press Space", at)
                 record(first, "001_episode", at)
@@ -252,7 +382,8 @@ class TestDataflow(unittest.TestCase):
                 first.stop()
             task = Path(tmp) / "pick_cup"
             self.assertEqual(episode_dirs(task), ["001_episode"])
-            self.assertEqual(json.loads((task / "task.json").read_text()), {"instruction": "pick up the cup"})
+            self.assertEqual(json.loads((task / "task.json").read_text()),
+                             {"instruction": "pick up the cup", "steps": ["pick", "place"]})
             self.assertEqual(json.loads((task / "001_episode" / "episode.json").read_text())["instruction"],
                              "pick up the cup")
             self.assertEqual(sorted(p.name for p in Path(tmp).iterdir() if p.is_dir()), ["_logs", "pick_cup"])
@@ -261,6 +392,7 @@ class TestDataflow(unittest.TestCase):
                 at = second.wait_for("1  pick_cup  (1 episode, last 001_episode)")
                 second.key(b"e")  # the only task: no number to choose
                 at = second.wait_for("Instruction: pick up the cup", at)  # from task.json: not asked again
+                at = second.wait_for("Steps: pick -> place", at)  # nor the steps
                 at = second.wait_for("Task pick_cup: last episode 001_episode (", at)
                 second.wait_for("Next: 002_episode", at)
             finally:

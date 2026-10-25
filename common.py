@@ -216,6 +216,67 @@ def pose9d(T):
     return np.r_[T[:3, 3], mat_to_rot6d(T[:3, :3])]
 
 
+def relative_rotvec(R0, R1):
+    """Rotation vector of R0^T R1: R1 = R0 exp(rotvec), the shortest way from R0 to R1. Below 120 deg from the
+    antisymmetric part (exactly 0 for R0 = R1; matrix_pose's square roots turn 1e-16 into 1e-8 there)."""
+    R = np.asarray(R0, dtype=float).T @ np.asarray(R1, dtype=float)
+    v = .5 * np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])  # sin(angle) x axis
+    s, c = np.linalg.norm(v), (np.trace(R) - 1) / 2
+    if c > -.5:
+        return v * (np.arctan2(s, c) / s) if s > 1e-15 else v
+    T = np.eye(4)
+    T[:3, :3] = R
+    return matrix_pose(T)[3:]
+
+
+def rotate_by(R, rotvec):
+    return np.asarray(R, dtype=float) @ pose_matrix(np.r_[0., 0., 0., rotvec])[:3, :3]
+
+
+def waypoint_plan(message):
+    """Policy `waypoints` message (t_ns, poses = xyz + rot6d, gripper 0..1, per waypoint) -> (times int64,
+    poses (N, 4, 4), gripper (N,), id)."""
+    times = np.asarray(message["t_ns"], dtype=np.int64)
+    poses, grip = np.asarray(message["poses"], dtype=float), np.asarray(message["gripper"], dtype=float)
+    if (poses.ndim != 2 or poses.shape[1] != 9 or not len(times) == len(poses) == len(grip) > 0
+            or not np.isfinite(poses).all() or not np.isfinite(grip).all() or (np.diff(times) <= 0).any()):
+        raise ValueError("Invalid policy waypoints")
+    T = np.tile(np.eye(4), (len(times), 1, 1))
+    T[:, :3, :3], T[:, :3, 3] = rot6d_to_mat(poses[:, 3:]), poses[:, :3]
+    return times, T, grip, message.get("id")
+
+
+def waypoint_pose(times, poses, now_ns):
+    """Pose at now_ns on timed waypoints (sorted times, (N, 4, 4) poses): linear in position, the shortest rotation
+    in between; before the first / after the last waypoint: that waypoint (the target holds there)."""
+    j = int(np.searchsorted(times, now_ns, side="right"))
+    if j == 0 or j == len(times):
+        return np.array(poses[0 if j == 0 else -1], dtype=float)
+    T0, T1 = poses[j - 1], poses[j]
+    u = (now_ns - times[j - 1]) / (times[j] - times[j - 1])
+    out = np.eye(4)
+    out[:3, 3] = (1 - u) * T0[:3, 3] + u * T1[:3, 3]
+    out[:3, :3] = rotate_by(T0[:3, :3], u * relative_rotvec(T0[:3, :3], T1[:3, :3]))
+    return out
+
+
+def waypoint_value(times, values, now_ns):
+    """The value of the last waypoint at or before now_ns (the first one before it): a step, not interpolated."""
+    return float(values[max(int(np.searchsorted(times, now_ns, side="right")) - 1, 0)])
+
+
+def approach(T, goal, max_m, max_rad):
+    """T moved toward goal by at most max_m (translation) and max_rad (rotation, the shortest way): the speed limit
+    on the policy target, so a jump (a new action chunk, or a slow reply) becomes a ramp."""
+    T, goal = np.asarray(T, dtype=float), np.asarray(goal, dtype=float)
+    out = T.copy()
+    d = goal[:3, 3] - T[:3, 3]
+    out[:3, 3] = T[:3, 3] + d * min(1., max_m / max(np.linalg.norm(d), 1e-12))
+    rv = relative_rotvec(T[:3, :3], goal[:3, :3])
+    out[:3, :3] = rotate_by(T[:3, :3], rv * min(1., max_rad / max(np.linalg.norm(rv), 1e-12)))
+    return out
+
+
 def send_json(node, name, obj):
     import pyarrow as pa
     node.send_output(name, pa.array([json.dumps(obj, allow_nan=False)]))

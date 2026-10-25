@@ -173,7 +173,64 @@ class TestConversions(unittest.TestCase):
             vpp.square(image, 256, (0, 0, 641, 480))
 
 
+class TestSegments(unittest.TestCase):
+    def test_each_step_runs_from_the_previous_enter_to_its_own(self):
+        t = np.arange(10) * 100 * MS  # 0 .. 900 ms
+        segs = vpp.segments(t, ["open", "pick", "place"], [300 * MS, 650 * MS, 900 * MS])
+        self.assertEqual(segs, [{"start_frame": 0, "end_frame": 3, "primary_action_verb": "open"},  # 300: open's
+                                {"start_frame": 4, "end_frame": 6, "primary_action_verb": "pick"},
+                                {"start_frame": 7, "end_frame": 9, "primary_action_verb": "place"}])
+
+    def test_steps_after_the_last_enter_belong_to_the_last_step(self):
+        t = np.arange(10) * 100 * MS
+        segs = vpp.segments(t, ["pick", "place"], [450 * MS, 820 * MS])  # the last frames came after the Enter
+        self.assertEqual(segs, [{"start_frame": 0, "end_frame": 4, "primary_action_verb": "pick"},
+                                {"start_frame": 5, "end_frame": 9, "primary_action_verb": "place"}])
+
+    def test_a_step_shorter_than_one_grid_step_is_left_out(self):
+        t = np.arange(10) * 100 * MS
+        segs = vpp.segments(t, ["open", "pick", "place"], [300 * MS, 350 * MS, 900 * MS])
+        self.assertEqual(segs, [{"start_frame": 0, "end_frame": 3, "primary_action_verb": "open"},
+                                {"start_frame": 4, "end_frame": 9, "primary_action_verb": "place"}])
+
+    def test_no_segments_unless_every_step_was_ended(self):
+        t = np.arange(10) * 100 * MS
+        self.assertIsNone(vpp.segments(t, ["open", "pick", "place"], [300 * MS, 650 * MS]))  # Space after 2 of 3
+        self.assertIsNone(vpp.segments(t, [], []))  # a task without steps
+        self.assertIsNone(vpp.segments(t, None, None))  # an episode from before steps existed
+
+
 class TestExport(unittest.TestCase):
+    def test_export_writes_segments_and_the_segments_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "_vpp"
+            steps = ["open", "pick", "place"]
+            # steps of make_episode at 13, 113, ..., 1413 ms (15)
+            first, times = make_episode(Path(tmp), "010_episode")
+            ann = vpp.export(root, first, ["fixed", "wrist"], times, robot(), "x", steps=steps,
+                             step_ends=[313 * MS, 813 * MS, 1450 * MS])
+            want = [{"start_frame": 0, "end_frame": 3, "primary_action_verb": "open"},
+                    {"start_frame": 4, "end_frame": 8, "primary_action_verb": "pick"},
+                    {"start_frame": 9, "end_frame": 14, "primary_action_verb": "place"}]
+            self.assertEqual(ann["segments"], want)
+            self.assertEqual(json.loads((root / "annotation/val/10.json").read_text())["segments"], want)
+            second, _ = make_episode(Path(tmp), "011_episode")
+            vpp.export(root, second, ["fixed", "wrist"], times, robot(), "x", steps=steps,
+                       step_ends=[113 * MS, 213 * MS, 1450 * MS])
+            segments_file = lambda: json.loads((root / "segments.json").read_text())
+            self.assertEqual(segments_file(), {  # the shape of AtomicVPP's libero_cosmos_segments.json
+                "10": {"all_frames": 15, "segments": want},
+                "11": {"all_frames": 15, "segments": [
+                    {"start_frame": 0, "end_frame": 1, "primary_action_verb": "open"},
+                    {"start_frame": 2, "end_frame": 2, "primary_action_verb": "pick"},
+                    {"start_frame": 3, "end_frame": 14, "primary_action_verb": "place"}]}})
+            ann = vpp.export(root, second, ["fixed", "wrist"], times, robot(), "x", steps=steps,
+                             step_ends=[113 * MS])  # re-export with only one step ended: no segments any more
+            self.assertNotIn("segments", ann)
+            self.assertEqual(list(segments_file()), ["10"])
+            vpp.remove(root, 10)  # d, y
+            self.assertFalse((root / "segments.json").exists())  # no episode with segments left
+
     def test_export_writes_the_vpp_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
             episode, times = make_episode(Path(tmp))
@@ -310,7 +367,8 @@ class TestRunFiles(unittest.TestCase):
                     w.writerow(["index", "host_receive_mono_ns", "frame_mono_ns"])
                     w.writerows((i, v + 15 * MS, v) for i, v in enumerate(t.tolist()))
             info = {"task": "pick_cup", "run": "run1", "completed": True, "end_reason": "stopped"}
-            (episode / "episode.json").write_text(json.dumps(info))
+            (episode / "episode.json").write_text(json.dumps({**info, "steps": ["pick", "place"],
+                                                              "step_end_host_mono_ns": [500 * MS, 1450 * MS]}))
             (task / "002_episode").mkdir()  # the run ended while recording it
             (task / "002_episode" / "episode.json").write_text(json.dumps({**info, "completed": False}))
             out = io.StringIO()
@@ -321,6 +379,8 @@ class TestRunFiles(unittest.TestCase):
             self.assertEqual((ann["texts"], ann["video_length"], ann["source"]["run"]), (["pick up the cup"], 15, "run1"))
             self.assertEqual(ann["crop"], {"fixed": [150, 100, 500, 450]})  # the default, vpp.CROP
             self.assertEqual(np.array(ann["actions"])[:, 9].tolist(), [0.] * 4 + [1.] * 11)  # steps from 413 ms
+            self.assertEqual(ann["segments"], [{"start_frame": 0, "end_frame": 4, "primary_action_verb": "pick"},
+                                               {"start_frame": 5, "end_frame": 14, "primary_action_verb": "place"}])
             with contextlib.redirect_stdout(out):
                 self.assertEqual(vpp.main([str(task), "001_episode", "--instruction", "lift the cup",
                                            "--out", str(Path(tmp) / "elsewhere")]), 0)

@@ -6,6 +6,9 @@
   videos/<split>/<id>/<k>.mp4               camera k of VPP_CAMERAS (0 = rgb_static, 1 = rgb_gripper), SIZE x SIZE,
                                             H.264 (VideoWriter: plays in browsers / VS Code; decord reads it)
   latent_videos/<split>/<id>/<k>.pt         SVD VAE latents: not written here (vpp_latents.py, on a GPU machine)
+  segments.json                             atomic sub-skill segments of every episode that has them, in the shape
+                                            of AtomicVPP's libero_cosmos_segments.json: {"<id>": {"all_frames",
+                                            "segments": [{start_frame, end_frame, primary_action_verb}]}}
 <id> = episode number (007_episode -> 7); <split> = val for every VAL_EVERY-th episode number, train otherwise.
 Steps: a uniform FPS grid (VPP: 0.1 s) over the time every camera recorded (and the robot: steps at the start or
 end without robot records are left out); per camera the frame nearest to each step; the robot interpolated there.
@@ -15,7 +18,10 @@ action (10) = servo target xyz + rot6d (ur5 target_pose: where the SpaceMouse se
 VPP learns action - state (its x-bot dataset: actions[t .. t+n] - states[t]), so both are in one space. rot6d, not
 a quaternion: the TCP points down, qw is near 0, and a sign-canonical quaternion jumps between q and -q.
 The annotation also has keys VPP does not read: fps, cameras, crop, state_layout, video_codec, source (episode, run,
-step times, the raw frame index of each step per camera, the largest frame-to-step offset).
+step times, the raw frame index of each step per camera, the largest frame-to-step offset), and for an episode of a
+multi-step task whose every step was ended (Enter) its segments (as in segments.json): step k at time t belongs to
+the step whose Enter is the first at or after t (after the last Enter: the last step); a step shorter than one
+grid step has no segment.
 
 CLI, to (re-)export recorded episodes from their videos, CSVs and the run's robot.jsonl (e.g. other settings; frame
 times of older recordings are retimed here as the recorder now does, recorder.retime):
@@ -29,6 +35,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import threading
 
 import numpy as np
 
@@ -37,6 +44,7 @@ from task import default_instruction, read_instruction
 
 STATE_LAYOUT = ["x", "y", "z", "r11", "r12", "r13", "r21", "r22", "r23", "gripper"]
 CROP = "fixed:150,100,500,450"  # the CLI default, as VPP_CROP in dataflow.yml: the table and the arm in the fixed view
+SEGMENTS_LOCK = threading.Lock()  # segments.json: exports run in threads of the recorder, d + y in its node loop
 
 
 def parse_crops(text):
@@ -220,19 +228,50 @@ def write_video(src, dst, frame_ids, size, fps, crop=None):
     return out.codec
 
 
+def segments(t, steps, step_ends):
+    """-> [{start_frame, end_frame, primary_action_verb}] over the step times t (ns), or None unless every one of
+    `steps` has its end time in step_ends (ns): step k belongs to the first step ending at or after t[k], steps after
+    the last end to the last step; a step without a grid step in it is left out."""
+    if not steps or step_ends is None or len(step_ends) != len(steps):
+        return None
+    owner = np.searchsorted(np.asarray(step_ends, dtype=np.int64), t, side="left").clip(0, len(steps) - 1)
+    return [{"start_frame": int(k[0]), "end_frame": int(k[-1]), "primary_action_verb": verb}
+            for i, verb in enumerate(steps) if len(k := np.flatnonzero(owner == i))]
+
+
+def set_segments(root, number, entry):
+    """Put the segments.json entry of episode `number` (None: remove it; an empty file is deleted)."""
+    path = root / "segments.json"
+    with SEGMENTS_LOCK:
+        known = json.loads(path.read_text()) if path.exists() else {}
+        if entry is None and str(number) not in known:
+            return
+        known.pop(str(number), None)
+        if entry is not None:
+            known[str(number)] = entry
+        if not known:
+            path.unlink()
+            return
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(dict(sorted(known.items(), key=lambda item: int(item[0]))), indent=1))
+        tmp.replace(path)
+
+
 def remove(root, number):
     """Delete the export of episode `number` from the VPP folder root (any split; none there is fine)."""
     for split in ("train", "val"):
         (root / "annotation" / split / f"{number}.json").unlink(missing_ok=True)  # first: VPP finds episodes by it
         for kind in ("videos", "latent_videos"):
             shutil.rmtree(root / kind / split / str(number), ignore_errors=True)
+    set_segments(root, number, None)
 
 
 def export(root, episode, cameras, frame_times, robot, instruction, fps=10, size=256, val_every=10,
-           max_gap_ns=50e6, source=None, crops=None):
+           max_gap_ns=50e6, source=None, crops=None, steps=None, step_ends=None):
     """Write the recorded episode directory `episode` into the VPP folder root; -> its annotation.
     cameras: roles in VPP camera order; frame_times[role]: frame_mono_ns of each frame of <role>.mp4 (its CSV rows);
-    robot: robot_arrays(); crops: parse_crops() (cameras without one: the whole frame). The annotation is written
+    robot: robot_arrays(); crops: parse_crops() (cameras without one: the whole frame); steps, step_ends: the
+    episode's step verbs and the time (ns) each one ended (episode.json), for its segments. The annotation is written
     last (atomically): an export cut short stays invisible to VPP."""
     crops = crops or {}
     if unknown := sorted(set(crops) - set(cameras)):
@@ -265,10 +304,14 @@ def export(root, episode, cameras, frame_times, robot, instruction, fps=10, size
                       "frame_index": {c: picks[c].tolist() for c in cameras},
                       "max_offset_ms": {c: round(float(np.abs(np.asarray(frame_times[c])[picks[c]] - t).max()) / 1e6, 3)
                                         for c in cameras}}}
+    if (segs := segments(t, steps, step_ends)) is not None:
+        ann["segments"] = segs
     path = root / "annotation" / split / f"{number}.json"
     tmp = path.with_name(path.name + ".tmp")  # not *.json: VPP skips it
     tmp.write_text(json.dumps(ann, allow_nan=False))
     tmp.replace(path)
+    if segs is not None:
+        set_segments(root, number, {"all_frames": len(t), "segments": segs})
     return ann
 
 
@@ -332,13 +375,15 @@ def main(argv=None):
                            or default_instruction(task.name))
             ann = export(root, episode, cameras, times, robot, instruction, args.fps, args.size, args.val_every,
                          args.max_gap_ms * 1e6, source={"task": info["task"], "run": info["run"]},
-                         crops={c: crops[c] for c in cameras if c in crops})
+                         crops={c: crops[c] for c in cameras if c in crops}, steps=info.get("steps"),
+                         step_ends=info.get("step_end_host_mono_ns"))
         except (OSError, ValueError, KeyError, IndexError, RuntimeError) as exc:
             print(f"{name}: FAILED: {exc}")
             failed += 1
             continue
         print(f"{name} -> {ann['videos'][0]['video_path'].split('/')[1]} {ann['episode_id']}: "
-              f"{ann['video_length']} steps, \"{instruction}\", max frame offset {ann['source']['max_offset_ms']} ms")
+              f"{ann['video_length']} frames, \"{instruction}\", max frame offset {ann['source']['max_offset_ms']} ms"
+              + (f", {len(ann['segments'])} segments" if "segments" in ann else ""))
     print(f"VPP folder: {root}")
     return 1 if failed else 0
 

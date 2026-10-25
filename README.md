@@ -32,6 +32,7 @@ cp teleop.local.env.example teleop.local.env                          # fill in 
 DRY_RUN=1 ./teleop.sh           # do not connect to the robot
 OUT_DIR=/some/dir ./teleop.sh   # data location, default data/ in this directory
 TASK=pick_cup ./teleop.sh       # skip the task question (continues pick_cup, or starts it if it is new)
+STEPS="open pick place close" ./teleop.sh   # skip the steps question
 ```
 
 Tasks: each task has its own folder `OUT_DIR/<task name>/`. At start-up, before the robot moves, teleop.sh lists the
@@ -55,6 +56,20 @@ spaces. It is asked once per task and kept in `<task>/task.json` (edit that file
 `python vpp.py <task dir> --instruction "..."` rewrites it in the VPP export of earlier ones). `INSTRUCTION="..."`
 skips the question.
 
+Then the task's steps: the verbs of its atomic sub-skills in order, for AtomicVPP, which trains one expert per skill
+(see "Atomic sub-skill segments"):
+
+```
+Steps of this task, verbs in order (e.g. open pick place close; Enter = no steps): open pick place close
+  4 steps: open -> pick -> place -> close
+```
+
+A step is one word of letters (commas and `->` between them are fine too). A verb outside AtomicVPP's
+`pick place turn open close` is accepted with a warning: add it to AtomicVPP's skill list before training. Enter
+alone means no steps: Space starts and stops an episode, as before. The steps are asked once per task (also once
+for a task from before steps existed) and kept in `task.json` as `"steps"`; `STEPS="..."` skips the question
+(`STEPS=""`: no steps). With `TASK=...` and nothing known, the task has no steps.
+
 Episode numbers are per task and continue across runs: the terminal shows the task's last episode (with its length,
 or INCOMPLETE if that run ended while recording) and the next one, e.g.
 `Task pick_cup: last episode 012_episode (54 s, saved)` / `Next: 013_episode`. Pass the same label file again to
@@ -63,7 +78,10 @@ continue a plan.
 The SpaceMouse (arm and gripper buttons) controls the robot only while an episode is being recorded: before Space,
 while an episode is saved and the robot resets, and between episodes the robot does not follow it.
 
-Keys: Space start / stop an episode; d then y delete the last episode of the task, also one of an earlier run (any
+Keys: Space start / stop an episode; Enter (a task with steps, while recording) end the current step, the last
+Enter also stops the episode (the status line shows the current step, e.g. `step 2/4 pick`; Space before the last
+step stops and saves the episode too, without segments: `2/4 steps: no segments` in the save message); d then y
+delete the last episode of the task, also one of an earlier run (any
 other key keeps it; the next episode takes its number and label again); h return home; Esc return home and quit;
 Ctrl-C quit without homing; SpaceMouse left button opens / right button closes the gripper (press again to stop).
 Start-up: preflight (robot, gripper, cameras) -> after 3 s the gripper opens and the robot returns home -> operate
@@ -72,16 +90,24 @@ opens fully (an object still held is released where the arm is), then the robot 
 starts the next episode only once that is done (`HOME_AFTER_EPISODE` in the `recorder` node of `dataflow.yml`, '0'
 turns it off). h and Esc return home without touching the gripper. The robot is locked while the cameras deliver
 no frames.
+A camera that delivers no frame for 1 s during an episode (`CAMERA_FAIL_S`) fails it: the episode is deleted (the
+next one takes its number and label again), the gripper opens and the robot returns home as after a saved episode,
+and the camera's stream is restarted (pipeline stop / start, then a hardware reset of the camera). Space waits until
+every camera delivers frames again (`wrist camera delivers frames again`). A camera still without frames 30 s after
+it stopped (`CAMERA_GIVE_UP_S`) ends the run once the robot is home; replug it and start teleop.sh again. Both are
+in the `recorder` node of `dataflow.yml`. Any error of the recorder ends the whole run, so the terminal is never left
+with a run whose robot no longer moves.
 Resolution and frame rate are set in the `recorder` node of `dataflow.yml`.
 
 ## Output
 
 ```
 OUT_DIR/<task name>/
-  task.json                    {"instruction": "..."}
+  task.json                    {"instruction": "...", "steps": ["open", "pick", ...]}
   <NNN>_<label>/
     episode.json               task, run, instruction, start / end time; per camera: frames, frames with pose,
-                               frame-number gaps, frames retimed (see below), fps
+                               frame-number gaps, frames retimed (see below), fps; steps and
+                               step_end_host_mono_ns (the time of each Enter, CLOCK_MONOTONIC as frame_mono_ns)
     <role>.mp4                 RGB video (mp4v, MPEG-4 Part 2: plays in VLC / ffplay, not in browsers or VS Code;
                                the VPP export and its preview are H.264); frame i = row i of the CSV
     <role>_frames.csv          per frame: SDK frame number, timestamp, host time, frame_mono_ns, pose_valid,
@@ -118,6 +144,7 @@ seconds; `VPP: <episode> exported` on the terminal) to `<task>/_vpp/`, in the la
   videos/{train,val}/<id>/0.mp4       fixed camera (VPP rgb_static), cropped (VPP_CROP), 256 x 256, 10 fps, H.264
   videos/{train,val}/<id>/1.mp4       wrist camera (VPP rgb_gripper)
   latent_videos/{train,val}/<id>/<k>.pt   SVD VAE latents: written by vpp_latents.py (below)
+  segments.json                       atomic sub-skill segments of the episodes with steps (AtomicVPP, below)
   preview/<id>.mp4                    optional, vpp_preview.py: both cameras side by side (not read by VPP)
 ```
 
@@ -149,6 +176,29 @@ number (its CSV row) and the gripper position / target, in real time (10 fps).
   `python vpp.py OUT_DIR/<task> [episode names] [--instruction "..."] [--crop "fixed:150,100,500,450"]
   [--val-every 10] [--out DIR]` (`--crop ''`: whole frames). A re-export also deletes the episode's latents.
 
+### Atomic sub-skill segments
+
+AtomicVPP's MoE policies route each training window to the expert of its skill, from a segments file in the shape
+of its `libero_cosmos_segments.json`. The export writes one for the episodes of a task with steps,
+`<task>/_vpp/segments.json`, keyed by episode id:
+
+```
+{"1": {"all_frames": 31, "segments": [{"start_frame": 0, "end_frame": 9, "primary_action_verb": "open"},
+                                      {"start_frame": 10, "end_frame": 18, "primary_action_verb": "pick"}, ...]}}
+```
+
+- Frames are the 10 Hz steps of the export (`all_frames` = the annotation's `video_length`). A step at time t
+  belongs to the step whose Enter is the first at or after t; the steps after the last Enter belong to the last
+  step. So the segments are contiguous and cover every frame, as AtomicVPP's loader requires. A step shorter than
+  0.1 s has no segment.
+- The annotation of the episode has the same list as `segments`.
+- Only episodes whose every step was ended with Enter get segments (one stopped early with Space does not).
+  Deleting an episode (d, y) or re-exporting it updates the file; an episode re-exported with `python vpp.py` gets
+  its segments from its `episode.json`.
+- AtomicVPP's dataset code and skill list are for LIBERO: training on the UR5 needs a UR5 copy of
+  `policy_models/datasets/libero_dataset_moe.py` that reads this file, and the skill list
+  (`policy_models/utils/libero_skill_mapping.py`) with the verbs used here.
+
 Then, on the GPU machine, in VPP's own Python environment:
 
 1. Latents: `python vpp_latents.py <svd-robot folder> OUT_DIR/<task>/_vpp` (skips videos that already have one).
@@ -162,17 +212,75 @@ Then, on the GPU machine, in VPP's own Python environment:
    loss slices in `policy_models/VPP_policy_xbot.py` (xyz `0:3`, rotation `3:9`, gripper `9:10`), and drop the
    third camera (`rgb_gripper2`) in `policy_models/datasets/xbot_dataset.py` (the policy works without it).
 
+## Running the VPP policy on the robot
+
+The trained policy runs in a server process (`step3_deploy_real_ur5.py` of `AtomicVPP_LIBERO`, conda env `vpp`),
+by default on this machine's GPU (a minimal copy in `../vpp`, see its README), or on pegasus. The dataflow records
+the cameras and the robot in real time, sends one observation per policy step and executes the action chunks it
+gets back:
+
+```
+dataflow (deploy.yml)                                           policy server (step3_deploy_real_ur5.py)
+  cameras -> policy.py: latest frame of each camera,
+             vpp.square (fixed view cropped FIRST, then           VAE + SVD features + action head
+             resized to 256), BGR -> RGB, state at frame time  -> 10 targets (xyz, rot6d, gripper), 0.1 s apart
+  ur5.py (CONTROL=policy) <- timed waypoints <- policy.py  <--  (absolute: chunk + state at the frame time)
+```
+
+```bash
+./deploy.sh                     # asks for the task (its instruction conditions the policy), then as teleop.sh
+DRY_RUN=1 ./deploy.sh           # pipeline check: real cameras and server, no robot (the state is simulated)
+```
+
+- `deploy.sh` checks the server and that its training data had the cameras, crop, size and fps of `deploy.yml`
+  (`python policy.py --check`), and starts it if none answers (`deploy_ur5_server.sh start`; it keeps running for
+  later runs). Where, `VPP_HOST`:
+  - `local` (default): this machine's GPU, from `../vpp` with the conda env `vpp`. Measured on the RTX 4070 Ti:
+    6.5 GB of its 12 GB, 1.4 GB of RAM once loaded (about 7 GB more while loading), ~30 s to load. Stop it to
+    free them: `bash ../vpp/deploy_ur5_server.sh stop`.
+  - an ssh host, e.g. `pegasus` (key login): `deploy.sh` opens an SSH tunnel to it and starts the server in
+    `/mnt/raptor/kim/AtomicVPP_LIBERO` on its least used GPU (~7.5 GB, ~1-5 min to load;
+    `ssh pegasus bash /mnt/raptor/kim/AtomicVPP_LIBERO/deploy_ur5_server.sh stop`).
+  - `''`: start nothing, the server already answers at `POLICY_ADDR`.
+
+  Server settings: `VPP_*` in `teleop.local.env` (see the example); default checkpoint
+  `ur5_dp/checkpoints/last.pt` with its EMA weights (lower val error than the raw weights in that run).
+- Keys: Space starts a rollout (the policy moves the robot) and stops it (the arm holds where it is, then the
+  gripper opens and the robot returns home); h stops it and returns home; Esc returns home and quits. A rollout
+  also stops after `ROLLOUT_MAX_S` (60 s), and when the server fails or answers later than `REQUEST_TIMEOUT_S`.
+  Keep the emergency stop at hand.
+- Motion: the ur5 node follows the chunk's targets at their times (interpolated at 125 Hz), never faster than
+  `MAX_LINEAR_M_S` / `MAX_ANGULAR_RAD_S`, inside the same workspace box and leash as teleop (`deploy.yml` has the
+  ur5 settings of `dataflow.yml`; a unit test keeps them equal); the gripper closes / opens when the chunk's
+  command crosses 0.5. Replanning (`REPLAN_STEPS: '0'`): the next observation is taken so its chunk arrives just
+  before the current one ends (frame to chunk ~225 ms with the server on this machine's RTX 4070 Ti, inference
+  ~180 ms while the cameras record; round trip ~265 ms on a pegasus V100 through the tunnel), i.e. about every
+  0.6 s.
+- Recorded, per run, in `OUT_DIR/<task>/_policy/<run>/`: `session.json` (the served checkpoint, its val metrics,
+  the settings), `robot.jsonl`, and each rollout `<NNN>_rollout/` as a teleop episode (`<role>.mp4`,
+  `<role>_frames.csv`, `episode.json`) plus `policy.jsonl` (per step: frame times, state, chunk, latency) and
+  `policy_<role>.mp4` (the 256 x 256 images the policy was given).
+- Before the first run on the robot, check the whole path except the robot on a recorded val episode:
+  `python policy_check.py OUT_DIR/<task>/010_episode` (with the server running: `bash ../vpp/deploy_ur5_server.sh
+  start`, or for pegasus with the tunnel open, e.g. while `deploy.sh` runs, or
+  `ssh -N -L 47110:127.0.0.1:47110 pegasus &`). It prepares the raw frames as the live node does and compares the
+  images with the export's frames (a mean difference of a few levels: H.264; ~20 or more: another crop or colour
+  order), the state with its states, and the chunks with the operator's actions (about the training val error).
+
 ## Tests (run in this directory, with the Python environment that has the requirements installed)
 
 ```bash
 tests/smoke.sh                                          # SMOKE: the tool starts and shows its first prompt
 python -m unittest tests.test_recorder tests.test_common tests.test_control \
-    tests.test_keyboard tests.test_gripper tests.test_spacemouse tests.test_task tests.test_vpp   # UNIT
+    tests.test_keyboard tests.test_gripper tests.test_spacemouse tests.test_task tests.test_vpp \
+    tests.test_policy                                   # UNIT
                                                         # (test_vpp: also vpp_preview.py; expects ffmpeg with libx264)
 python -m unittest tests.test_vpp_latents               # UNIT, needs torch: skipped without it (stub VAE)
 python -m unittest tests.test_integration               # INTEGRATION: full dataflow + teleop.sh task question
                                                         # (mock mouse / cameras, DRY_RUN, keys typed into a pty)
+python -m unittest tests.test_deploy                    # INTEGRATION: policy dataflow + deploy.sh against a fake
+                                                        # policy server (tests/fake_policy_server.py)
 ```
 
-None of the tests connects to the robot or opens a real camera, and none needs the device settings in
-`teleop.local.env`.
+None of the tests connects to the robot, opens a real camera or needs the policy server, and none needs the
+device settings in `teleop.local.env`. `policy_check.py` (above) is the check against the real server.

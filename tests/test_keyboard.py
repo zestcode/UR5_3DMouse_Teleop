@@ -1,5 +1,5 @@
 import unittest
-from keyboard import delete_keys, lone_esc
+from keyboard import delete_keys, enter_keys, lone_esc
 
 
 def feed(steps):
@@ -41,6 +41,18 @@ class DeleteKeyTests(unittest.TestCase):
 
     def test_y_without_d_and_plain_keys_send_nothing(self):
         self.assertEqual(delete_keys(b"y h", False), ([], False))
+
+
+class EnterKeyTests(unittest.TestCase):
+    def test_each_enter_counts_once_whatever_the_line_ending(self):
+        self.assertEqual(enter_keys(b"\n"), 1)  # cbreak with ICRNL (the usual terminal)
+        self.assertEqual(enter_keys(b"\r"), 1)  # a terminal without ICRNL
+        self.assertEqual(enter_keys(b"\r\n"), 1)
+        self.assertEqual(enter_keys(b"\n \nx\r"), 3)  # several in one read, between other keys
+
+    def test_other_keys_are_not_enter(self):
+        self.assertEqual(enter_keys(b""), 0)
+        self.assertEqual(enter_keys(b" dyh\x1b[A"), 0)
 
 
 if __name__ == "__main__":

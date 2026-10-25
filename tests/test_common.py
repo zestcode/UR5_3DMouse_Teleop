@@ -2,9 +2,9 @@ import os
 import unittest
 from unittest.mock import patch
 import numpy as np
-from common import (clamp_box, flange_from_tcp, follow_leash, integrate_pose, limited_twist, map_motion,
+from common import (approach, clamp_box, flange_from_tcp, follow_leash, integrate_pose, limited_twist, map_motion,
                     mat_to_rot6d, matrix_pose, pose9d, pose_error, pose_matrix, rot6d_to_mat, smooth_twist, vector,
-                    workspace_bounds, within_workspace)
+                    waypoint_plan, waypoint_pose, waypoint_value, workspace_bounds, within_workspace)
 
 
 class TeleopTests(unittest.TestCase):
@@ -181,6 +181,44 @@ class TargetTests(unittest.TestCase):
         for _ in range(200):
             T = follow_leash(T, integrate_pose(T, [0, 0, 0, 0, 0, 0.5], 0.008), actual, 0.03, 0.2)
         self.assertLessEqual(pose_error(T, actual)[1], 0.2 + 1e-9)
+
+
+class WaypointTests(unittest.TestCase):
+    """CONTROL=policy: the target follows the policy's timed waypoints, speed-limited."""
+
+    def plan(self):
+        R0 = pose_matrix([0, 0, 0, 2.2302, 2.2111, 0.0071])[:3, :3]  # home-like orientation, ~178.6 deg
+        R1 = pose_matrix([0, 0, 0, 0, 0, 0.2])[:3, :3] @ R0             # 0.2 rad about base z later
+        message = {"id": 3, "t_ns": [100, 200], "gripper": [0, 1],
+                   "poses": [[.4, 0, .3, *mat_to_rot6d(R0)], [.5, 0, .3, *mat_to_rot6d(R1)]]}
+        return waypoint_plan(message), R0, R1
+
+    def test_plan_parsing_and_validation(self):
+        (times, poses, grip, plan_id), R0, _ = self.plan()
+        self.assertEqual((times.tolist(), grip.tolist(), plan_id), ([100, 200], [0, 1], 3))
+        np.testing.assert_allclose(poses[0][:3, :3], R0, atol=1e-12)
+        good = {"t_ns": [1, 2], "poses": [[0] * 3 + [1, 0, 0, 0, 1, 0]] * 2, "gripper": [0, 0]}
+        for bad in ({"t_ns": [2, 1]}, {"t_ns": [1]}, {"poses": [[0] * 9] * 2 + [[float("nan")] * 9]},
+                    {"poses": [[0] * 8] * 2}, {"gripper": [0, float("nan")]}):
+            with self.assertRaises(ValueError):
+                waypoint_plan({**good, **bad})
+
+    def test_interpolates_between_and_holds_outside(self):
+        (times, poses, grip, _), R0, R1 = self.plan()
+        mid = waypoint_pose(times, poses, 150)
+        np.testing.assert_allclose(mid[:3, 3], [.45, 0, .3], atol=1e-12)
+        np.testing.assert_allclose(mid[:3, :3], pose_matrix([0, 0, 0, 0, 0, 0.1])[:3, :3] @ R0, atol=1e-9)  # half way
+        np.testing.assert_allclose(waypoint_pose(times, poses, 0), poses[0])      # before: the first
+        np.testing.assert_allclose(waypoint_pose(times, poses, 10**9), poses[1])  # after: holds at the last
+        self.assertEqual([waypoint_value(times, grip, t) for t in (0, 100, 199, 200, 300)], [0, 0, 0, 1, 1])  # a step
+
+    def test_approach_limits_translation_and_rotation(self):
+        (_, poses, _, _), R0, R1 = self.plan()
+        out = approach(poses[0], poses[1], 0.01, 0.05)
+        np.testing.assert_allclose(out[:3, 3], [.41, 0, .3], atol=1e-12)  # 1 cm of the 10 cm
+        np.testing.assert_allclose(out[:3, :3], pose_matrix([0, 0, 0, 0, 0, 0.05])[:3, :3] @ R0, atol=1e-9)
+        np.testing.assert_allclose(approach(poses[0], poses[1], 1, 1), poses[1], atol=1e-12)  # within reach: there
+        np.testing.assert_allclose(approach(poses[1], poses[1], .01, .05), poses[1], atol=1e-12)  # no NaN at 0
 
 
 if __name__ == "__main__":

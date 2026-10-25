@@ -5,15 +5,20 @@ measured pose), clamped to the workspace and leashed to the robot, and streamed 
 at CONTROL_HZ; the UR controller smooths it (lookahead). No speedL / blocking speedStop in the loop.
 Real mode is paced by the controller's own RTDE packets, not a host timer: one servoL per controller
 cycle at a fixed phase, so the host and controller clocks never slip against each other.
+CONTROL=policy (deploy.yml): the target follows the policy node's timed waypoints (`waypoints`, the action chunk)
+instead of the mouse: interpolated at each cycle, moved toward at most MAX_LINEAR_M_S / MAX_ANGULAR_RAD_S, then
+clamped and leashed as the mouse target; the gripper takes the chunk's command (> 0.5 = close) when it changes.
+The heartbeat comes from the policy node then (`recording` = a rollout is running); without it the target holds
+and the chunk is dropped.
 """
 import os
 import signal
 import time
 import numpy as np
 from dora import Node
-from common import (clamp_box, command_live, flange_from_tcp, follow_leash, integrate_pose, limited_twist,
+from common import (approach, clamp_box, command_live, flange_from_tcp, follow_leash, integrate_pose, limited_twist,
                     matrix_pose, number, pose9d, pose_error, pose_matrix, read_json, send_json, smooth_twist,
-                    vector, workspace_bounds, within_workspace)
+                    vector, waypoint_plan, waypoint_pose, waypoint_value, workspace_bounds, within_workspace)
 from gripper import FakeRobotiq, Gripper
 
 
@@ -145,6 +150,11 @@ def main():
     home = np.radians(vector("HOME_Q_DEG", home_deg, 6)) if home_deg else None
     home_speed, home_acceleration = number("HOME_SPEED", .2), number("HOME_ACCELERATION", .3)
     home_delay = number("HOME_DELAY_S", 3)
+    policy = os.getenv("CONTROL", "spacemouse") == "policy"
+    if os.getenv("CONTROL", "spacemouse") not in ("spacemouse", "policy"):
+        raise ValueError("CONTROL must be spacemouse or policy")
+    plan = None  # policy: (times, poses, gripper, id) of the latest action chunk
+    plan_close = None  # policy: the gripper command last sent (True = close; None = none since start / h)
     node = Node()
     control = receive = gripper = None
     command = None
@@ -216,6 +226,8 @@ def main():
                 if event["type"] == "INPUT":
                     if event["id"] == "command":
                         command = read_json(event)
+                    elif event["id"] == "waypoints" and policy:
+                        plan = waypoint_plan(read_json(event))
                     elif event["id"] == "heartbeat":
                         beat = read_json(event)
                         heartbeat, recording = beat["t_ns"], bool(beat.get("recording", False))
@@ -240,6 +252,7 @@ def main():
                 opener = gripper if reason == "reset" else None  # reset = episode start state: gripper open too
                 homed = real and home is not None
                 during = set()  # inputs that arrived while homing
+                plan, plan_close = None, (False if opener is not None else None)  # reset: the gripper is open
                 if homed:
                     if servoing:
                         checked(control.servoStop(stop_acceleration), "servoStop")
@@ -265,16 +278,27 @@ def main():
             target = limited_twist(command, now, timeout, linear, angular)
             recorder_ok = 0 <= now - heartbeat <= recorder_timeout * 1e9
             # Disabled, stale or no recorder, or no episode being recorded: freeze the target at once.
-            # Deadzone release: ramp down via the filter.
-            hard_stop = not recorder_ok or not recording or not command_live(command, now, timeout)
+            # Deadzone release: ramp down via the filter. Policy: no mouse; a paused rollout never resumes a chunk.
+            hard_stop = not recorder_ok or not recording or not (policy or command_live(command, now, timeout))
             if hard_stop:
                 target[:] = 0
                 twist = np.zeros(6)
-            else:
+                plan = None
+            elif not policy:
                 twist = smooth_twist(twist, target, step, tau)
                 if (not np.any(target) and np.linalg.norm(twist[:3]) < 5e-4
                         and np.linalg.norm(twist[3:]) < 5e-3):
                     twist = np.zeros(6)  # tail of the ramp: below 0.5 mm/s and 0.005 rad/s
+            proposal = integrate_pose(T_target, twist, step)  # policy: twist 0, the target holds without a chunk
+            if plan is not None:
+                times, poses, closes, _ = plan
+                proposal = approach(T_target, waypoint_pose(times, poses, now), linear * step, angular * step)
+                close = waypoint_value(times, closes, now) > .5
+                if gripper is not None and close != plan_close:
+                    button = "close" if close else "open"
+                    gripper.press(button, toggle=False)
+                    gripper_events.append(button)
+                    plan_close = close
             if gripper is not None and gripper.error:
                 raise RuntimeError(f"Gripper failed: {gripper.error}")
             grip = {**gripper.snapshot(), "events": gripper_events} if gripper is not None else None
@@ -287,7 +311,7 @@ def main():
                 joints = receive.getActualQ()
                 actual_speed = receive.getActualTCPSpeed()
             # Target: integrate, clamp to the workspace (slides along the boundary), leash to the robot.
-            T_target = follow_leash(T_target, clamp_box(integrate_pose(T_target, twist, step), lo, hi, margin, T_target),
+            T_target = follow_leash(T_target, clamp_box(proposal, lo, hi, margin, T_target),
                                     pose_matrix(pose) if real else None, leash_m, leash_rad)
             if not real:
                 # Dry run: an ideal follower, so the target logic (clamp, integration) runs offline too.
@@ -295,9 +319,11 @@ def main():
             if now - last_print >= 200_000_000:  # 5 Hz status line in the dora console
                 last_print = now
                 err_m, err_rad = pose_error(T_target, pose_matrix(pose))
-                status = (f"mouse={np.round(command['axes'] if command else [0.] * 6, 2).tolist()} "
-                          f"enabled={bool(command and command['enabled'])} "
-                          f"recorder={'ok' if recorder_ok else 'STALE'} recording={'yes' if recording else 'no'} "
+                source = (f"policy plan={plan[3] if plan else None} "
+                          f"plan_left={max(plan[0][-1] - now, 0) / 1e9 if plan else 0:.2f}s " if policy else
+                          f"mouse={np.round(command['axes'] if command else [0.] * 6, 2).tolist()} "
+                          f"enabled={bool(command and command['enabled'])} ")
+                status = (source + f"recorder={'ok' if recorder_ok else 'STALE'} recording={'yes' if recording else 'no'} "
                           f"target={'FROZEN' if hard_stop else 'live'} "
                           f"twist={np.round(twist, 4).tolist()} "
                           f"target_err={err_m * 1e3:.1f}mm/{np.degrees(err_rad):.2f}deg")
@@ -322,6 +348,7 @@ def main():
                       "target_twist": target.tolist(), "hard_stop": bool(hard_stop), "recording": recording,
                       "gripper": grip, "simulated": not real,
                       "reset_done": reset_done,  # id of the last recorder reset that has reached home
+                      **({"plan_id": plan[3] if plan else None} if policy else {}),  # the chunk being followed
                       "robot_mode": receive.getRobotMode() if real else 7,
                       "safety_mode": receive.getSafetyMode() if real else 1})
         # Esc: leave servo mode, return home, then end the whole dataflow (Ctrl-C ends it without homing).

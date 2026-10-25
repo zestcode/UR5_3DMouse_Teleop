@@ -1,4 +1,4 @@
-data/
+*data*
 out/
 __pycache__/
 *.local.env

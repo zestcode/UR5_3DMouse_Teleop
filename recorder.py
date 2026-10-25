@@ -6,11 +6,19 @@ task: the first episode of a run follows the task's highest-numbered episode (sh
 line NNN of EPISODE_PLAN as its label.
 Space (`record` input) starts / stops an episode; d then y (`delete` input) deletes the last episode of the task
 (also one of an earlier run), and the next episode takes its number and plan label again.
+Steps (STEPS, else task.json; asked by task.py): a multi-step task (open pick place close: the verbs of its atomic
+sub-skills) ends each step with Enter (`step` input: the time the keyboard read the key), the last Enter also stops
+the episode; Space stops it before that (saved with fewer step ends: the VPP export gives it no segments).
 The SpaceMouse moves the robot only while an episode is being recorded: the `heartbeat` output (sent while every
 camera delivers frames) carries `recording`, and the ur5 node freezes the arm and ignores the gripper buttons
 whenever it is false (before Space, while saving / resetting, after the last episode) or the heartbeat is stale.
 HOME_AFTER_EPISODE=1: once a stopped episode is saved, `reset` puts the robot back in the episode start state
 (gripper opened, then moveJ home); Space starts the next episode only after the ur5 state reports that reset done.
+A camera that delivers no frame for CAMERA_FAIL_S during an episode fails it: the episode is deleted (the next one
+takes its number), the robot is reset as after a saved episode, and the camera's thread restarts its stream (Space
+waits until every camera delivers again). A camera still without frames CAMERA_GIVE_UP_S after it stopped ends the
+run once the robot is home. Any error of this node stops the whole dataflow (SIGINT to `dora run`, as Esc does),
+so no node is left running without the recorder.
 The robot (`state` input, every ur5/state record) is kept for the whole run in robot.jsonl (unchanged JSON lines,
 raw evidence).
 VPP_CAMERAS set: each saved episode is also exported, in a background thread, to the VPP (Video Prediction Policy)
@@ -18,8 +26,9 @@ dataset folder <task>/_vpp/ (vpp.py: 10 Hz steps, every camera at each step, sta
 deleting the episode deletes its export too. Not for episodes ended by an error.
 
 OUT_DIR/<task>/
-  task.json                       the task's language instruction (INSTRUCTION, asked by task.py)
-  <NNN>_<label>/episode.json      task, run, instruction, start / end, per camera frame count + frame-number gaps
+  task.json                       the task's language instruction (INSTRUCTION) and steps (STEPS), asked by task.py
+  <NNN>_<label>/episode.json      task, run, instruction, start / end, per camera frame count + frame-number gaps,
+                                  steps + step_end_host_mono_ns (the Enter of each ended step, monotonic clock)
   <NNN>_<label>/<role>.mp4        RGB video (mp4v), frame i = row i of <role>_frames.csv
   <NNN>_<label>/<role>_frames.csv per frame: SDK frame number, timestamp + domain, host receive time, the frame
                                   time on the host monotonic clock, and the TCP / flange pose at that time, the
@@ -35,11 +44,15 @@ latency in the episode instead (frame_time_source = receive; timestamp_ms keeps 
 Pose at frame time: linear (xyz) + slerp (rotation) between the two bracketing robot records; pose_valid=0 when
 the frame lies outside the robot records or the bracket is wider than MAX_POSE_GAP_MS.
 Poses: base frame, metres, quaternion x y z w (from the ur5 node's rot6d = first two rows of R).
-Env: TASK (task folder name), INSTRUCTION (default: task.json, else the task name), CAMERAS (role:serial,...),
+Env: TASK (task folder name), INSTRUCTION (default: task.json, else the task name), STEPS (verbs separated by
+spaces, '' = none; default: task.json, else none), CAMERAS (role:serial,...),
 COLOR_W/COLOR_H/FPS, OUT_DIR, EPISODE_PLAN (labels, one per line), MAX_POSE_GAP_MS, VPP_CAMERAS (roles in VPP camera
 order, '' = no export), VPP_CROP (role:x0,y0,x1,y1 ..., vpp.parse_crops), VPP_FPS, VPP_SIZE, VPP_VAL_EVERY,
-MOCK_CAMERA=1 (synthetic frames, tests), START_RECORDING=1 (first episode starts by itself as soon as Space could
-start it, i.e. once the robot is ready; tests)."""
+CAMERA_FAIL_S, CAMERA_GIVE_UP_S,
+MOCK_CAMERA=1 (synthetic frames, tests), MOCK_CAMERA_FAIL=<role>:<s>[:dead] (tests: that mock camera stops <s> s into
+the first episode, as a D455 whose frames stop: no frame within 2 s, then an error; dead: it never comes back),
+START_RECORDING=1 (first episode starts by itself as soon as Space could start it, i.e. once the robot is ready;
+tests)."""
 import bisect
 import csv
 import json
@@ -47,6 +60,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import sys
 import threading
 import time
@@ -54,7 +68,7 @@ import time
 import numpy as np
 import pyarrow as pa
 
-from task import default_instruction, read_instruction
+from task import default_instruction, describe_steps, parse_steps, read_instruction, read_steps
 
 ROWS = ["index", "frame_number", "timestamp_ms", "timestamp_domain", "host_receive_mono_ns", "frame_mono_ns",
         "pose_valid", "pose_gap_ms", "tcp_x", "tcp_y", "tcp_z", "tcp_qx", "tcp_qy", "tcp_qz", "tcp_qw",
@@ -219,7 +233,7 @@ class Console:
 class Episode:
     """One episode directory; add() runs in the camera threads (one role per thread), close() in the node loop."""
 
-    def __init__(self, task, index, label, cameras, size, fps, run=None, instruction=None):
+    def __init__(self, task, index, label, cameras, size, fps, run=None, instruction=None, steps=None):
         import cv2
         self.name = f"{index:03d}_{label}"
         self.path = task / self.name
@@ -233,6 +247,8 @@ class Episode:
         self.info = {"name": self.name, "label": label, "index": index, "task": task.name, "run": run,
                      "instruction": instruction, "start_host_mono_ns": time.monotonic_ns(),
                      "start_host_unix_ns": time.time_ns(), "completed": False}
+        if steps is not None:  # teleop (policy rollouts: none)
+            self.info.update(steps=list(steps), step_end_host_mono_ns=[])
         self.write_info()
 
     def write_info(self):
@@ -272,31 +288,55 @@ class Episode:
         self.write_info()
         return self.info
 
+    def discard(self):
+        """Delete the episode (a camera stopped while it was recorded); the cameras are detached already."""
+        for writer in self.video.values():
+            writer.release()
+        shutil.rmtree(self.path)
+
 
 class Camera:
-    """One D455, color stream only, read in its own thread for the whole run."""
+    """One D455, color stream only, read in its own thread for the whole run. When its frames stop (no frame within
+    2 s) the error is kept in `error`; restart=True (recorder): the thread then restarts the stream until it
+    delivers again, else (policy) the thread ends."""
 
-    def __init__(self, role, serial, size, fps, mock=False):
+    def __init__(self, role, serial, size, fps, mock=False, restart=False):
         self.role, self.serial, self.size, self.fps, self.mock = role, serial, size, fps, mock
         self.lock, self.episode, self.last_ns, self.error = threading.Lock(), None, 0, None
-        self.running, self.intrinsics = True, None
+        self.running, self.intrinsics, self.restart = True, None, restart
+        fail = os.getenv("MOCK_CAMERA_FAIL", "").split(":") if mock else []
+        self.mock_fail = (float(fail[1]), fail[2:] == ["dead"]) if fail[:1] == [role] else None  # (after s, dead)
+        self.mock_dead = False
         if not mock:
             import pyrealsense2 as rs
-            self.pipe, config = rs.pipeline(), rs.config()
-            config.enable_device(serial)
-            config.enable_stream(rs.stream.color, size[0], size[1], rs.format.bgr8, fps)
-            profile = self.pipe.start(config).get_stream(rs.stream.color).as_video_stream_profile()
+            self.rs, self.pipe, self.config = rs, rs.pipeline(), rs.config()
+            self.config.enable_device(serial)
+            self.config.enable_stream(rs.stream.color, size[0], size[1], rs.format.bgr8, fps)
+            profile = self.pipe.start(self.config).get_stream(rs.stream.color).as_video_stream_profile()
             i = profile.get_intrinsics()
             self.intrinsics = {"width": i.width, "height": i.height, "fx": i.fx, "fy": i.fy, "ppx": i.ppx,
                                "ppy": i.ppy, "model": str(i.model), "coeffs": list(i.coeffs), "source": "SDK"}
         self.thread = threading.Thread(target=self.loop, daemon=True)
         self.thread.start()
 
+    def mock_stops(self):
+        """MOCK_CAMERA_FAIL: True once, when the episode this camera records is `after` s old."""
+        with self.lock:
+            episode = self.episode
+        if self.mock_fail is None or episode is None or \
+                time.monotonic_ns() - episode.info["start_host_mono_ns"] < self.mock_fail[0] * 1e9:
+            return False
+        self.mock_dead, self.mock_fail = self.mock_fail[1], None
+        return True
+
     def frames(self):
         if self.mock:
             n = 0
             while self.running:
                 time.sleep(1 / self.fps)
+                if self.mock_stops():
+                    time.sleep(2)  # wait_for_frames(2000)
+                    raise RuntimeError("Frame didn't arrive within 2000 (MOCK_CAMERA_FAIL)")
                 n += 1
                 image = np.full((self.size[1], self.size[0], 3), n % 256, np.uint8)
                 yield image, n, time.time_ns() / 1e6, "mock"
@@ -307,24 +347,58 @@ class Camera:
                        str(f.get_frame_timestamp_domain()).split(".")[-1])
 
     def loop(self):
+        attempt = 0  # restarts since the frames stopped
+        while self.running:
+            try:
+                for image, number, stamp_ms, domain in self.frames():
+                    mono, unix = time.monotonic_ns(), time.time_ns()
+                    self.last_ns, attempt = mono, 0
+                    frame_mono = int(round(stamp_ms * 1e6)) - (unix - mono) if domain in ("global_time", "mock") else mono
+                    with self.lock:
+                        if self.episode is not None:
+                            self.episode.add(self.role, image, {
+                                "frame_number": int(number), "timestamp_ms": float(stamp_ms), "timestamp_domain": domain,
+                                "host_receive_mono_ns": mono, "frame_mono_ns": frame_mono})
+            except Exception as exc:  # the heartbeat stops, so the arm freezes; the node loop sees no frames
+                self.error = exc
+                if not self.restart:
+                    return
+            while self.running:
+                attempt += 1
+                print(f"[recorder] {self.role} camera: {self.error!r}; restarting it (attempt {attempt})", flush=True)
+                try:
+                    self.reopen(attempt)
+                    break
+                except Exception as exc:
+                    self.error = exc
+                    time.sleep(2)
+
+    def reopen(self, attempt):
+        """Restart the stream after its frames stopped: pipeline stop + start; from the second attempt on, a
+        hardware reset of the device first (it comes back on USB after a few seconds)."""
+        if self.mock:
+            if self.mock_dead:
+                raise RuntimeError("the mock camera does not come back (MOCK_CAMERA_FAIL ...:dead)")
+            return
         try:
-            for image, number, stamp_ms, domain in self.frames():
-                mono, unix = time.monotonic_ns(), time.time_ns()
-                self.last_ns = mono
-                frame_mono = int(round(stamp_ms * 1e6)) - (unix - mono) if domain in ("global_time", "mock") else mono
-                with self.lock:
-                    if self.episode is not None:
-                        self.episode.add(self.role, image, {
-                            "frame_number": int(number), "timestamp_ms": float(stamp_ms), "timestamp_domain": domain,
-                            "host_receive_mono_ns": mono, "frame_mono_ns": frame_mono})
-        except Exception as exc:  # reported by the node loop; the heartbeat stops, so the arm freezes
-            self.error = exc
+            self.pipe.stop()
+        except RuntimeError:  # not streaming any more
+            pass
+        if attempt > 1:
+            for device in self.rs.context().query_devices():
+                if device.get_info(self.rs.camera_info.serial_number) == self.serial:
+                    device.hardware_reset()
+                    time.sleep(5)
+        self.pipe.start(self.config)
 
     def stop(self):
         self.running = False
         self.thread.join(timeout=3)
         if not self.mock:
-            self.pipe.stop()
+            try:
+                self.pipe.stop()
+            except RuntimeError:  # stopped by a failed restart
+                pass
 
 
 def main():
@@ -337,6 +411,7 @@ def main():
     max_gap_ns = float(os.getenv("MAX_POSE_GAP_MS", "50")) * 1e6
     plan = read_plan(os.getenv("EPISODE_PLAN", ""))
     home_after = os.getenv("HOME_AFTER_EPISODE", "0") == "1"
+    camera_fail_s, give_up_s = float(os.getenv("CAMERA_FAIL_S", "1")), float(os.getenv("CAMERA_GIVE_UP_S", "30"))
     cameras = os.getenv("CAMERAS", "") or ("wrist:mock,fixed:mock" if mock else "")  # role:serial,... (teleop.local.env)
     if not cameras or "<" in cameras:
         raise ValueError("CAMERAS not configured: set it in teleop.local.env (copy teleop.local.env.example)")
@@ -360,14 +435,15 @@ def main():
     run_dir = task / "_runs" / run
     run_dir.mkdir(parents=True, exist_ok=False)  # also creates a new task's folder
     instruction = os.getenv("INSTRUCTION", "").strip() or read_instruction(task) or default_instruction(task_name)
-    (task / "task.json").write_text(json.dumps({"instruction": instruction}, indent=1))
+    steps = parse_steps(os.environ["STEPS"]) if "STEPS" in os.environ else read_steps(task) or []
+    (task / "task.json").write_text(json.dumps({"instruction": instruction, "steps": steps}, indent=1))
     vpp_root = task / "_vpp"
     count, last = last_episode(task)  # count = number of the task's last episode, of any run
     console = Console()
     node = Node()
-    cams = [Camera(role, serial, size, fps, mock) for role, serial in roles]
+    cams = [Camera(role, serial, size, fps, mock, restart=True) for role, serial in roles]
     meta = {"schema": "ur5-teleop-rgb-pose-v1", "task": task_name, "run": run, "instruction": instruction,
-            "simulated_camera": mock,
+            "steps": steps, "simulated_camera": mock,
             "start_host_mono_ns": time.monotonic_ns(),
             "start_host_unix_ns": time.time_ns(), "color": {"width": size[0], "height": size[1], "fps": fps,
                                                             "format": "bgr8", "video": "mp4v"},
@@ -379,7 +455,7 @@ def main():
                       f"(implausible, i.e. after the receive or more than {MAX_FRAME_LATENCY_MS} ms before it: receive "
                       "- median latency, frame_time_source = receive); robot t_ns = CLOCK_MONOTONIC; "
                       "pose = interpolation of robot.jsonl at frame_mono_ns",
-            "env": {k: os.environ[k] for k in ("TASK", "INSTRUCTION", "CAMERAS", "COLOR_W", "COLOR_H", "FPS", "OUT_DIR",
+            "env": {k: os.environ[k] for k in ("TASK", "INSTRUCTION", "STEPS", "CAMERAS", "COLOR_W", "COLOR_H", "FPS", "OUT_DIR",
                                                 "EPISODE_PLAN", "DRY_RUN", "MOCK_CAMERA", "MOCK_MOUSE") if k in os.environ}}
 
     def save_meta():
@@ -398,15 +474,32 @@ def main():
         else:
             console.say(f"  All {len(plan)} episodes of the plan are recorded")
 
+    def clock(ns):
+        s = (ns - episode.info["start_host_mono_ns"]) / 1e9
+        return f"{int(s // 60):02d}:{int(s % 60):02d}"
+
     def start():
         nonlocal episode
-        episode = Episode(task, count + 1, label(count), cams, size, fps, run, instruction)
+        episode = Episode(task, count + 1, label(count), cams, size, fps, run, instruction, steps)
         for c in cams:
             with c.lock:
                 c.episode = episode
         meta["episodes"].append(episode.name)
         save_meta()
-        console.say(f"● Recording {episode.name}")
+        console.say(f"● Recording {episode.name}" + (f": step 1/{len(steps)} {steps[0]} (Enter = end of the step, "
+                                                       "the last Enter stops)" if steps else ""))
+
+    def end_step(key_ns, now):
+        """Enter while recording: the current step ended at key_ns; the last step also stops the episode."""
+        ends = episode.info["step_end_host_mono_ns"]
+        ends.append(key_ns)
+        episode.write_info()  # kept even if the run ends before the episode is saved
+        k = len(ends)
+        console.say(f"  Step {k}/{len(steps)} {steps[k - 1]} ended at {clock(key_ns)}"
+                    + (f"; now step {k + 1}/{len(steps)} {steps[k]}" if k < len(steps) else ""))
+        if k == len(steps):
+            pending.append((stop(), "stopped", now + 2e8))
+            beat(now)  # the SpaceMouse loses the robot now
 
     def stop():
         """Detach the episode from the cameras; it is closed 0.2 s later (pending), once the robot records that
@@ -422,10 +515,13 @@ def main():
         info = done.close(reason, np.array(robot_t, dtype=np.int64), np.array(robot_tcp), np.array(robot_flange),
                           max_gap_ns)
         secs = (info["end_host_mono_ns"] - info["start_host_mono_ns"]) / 1e9
+        ended = len(info.get("step_end_host_mono_ns", []))
+        stepped = (f", {ended}/{len(info['steps'])} steps" + ("" if ended == len(info["steps"]) else ": no segments")
+                   if info.get("steps") else "")
         parts = [f"{r} {c['frames']} frames ({c['frames_with_pose']} with pose, {c['frame_number_gaps']} dropped"
                  + (f", {c['frames_retimed']} with an implausible SDK time" if c["frames_retimed"] else "") + ")"
                  for r, c in info["cameras"].items()]
-        console.say(f"✓ {done.name} saved ({secs:.0f} s): " + ", ".join(parts))
+        console.say(f"✓ {done.name} saved ({secs:.0f} s{stepped}): " + ", ".join(parts))
         if vpp_cameras:
             export(done, reason)
 
@@ -443,9 +539,11 @@ def main():
         def work():
             try:
                 ann = vpp.export(vpp_root, done.path, vpp_cameras, times, robot, instruction, vpp_fps, vpp_size,
-                                 vpp_val_every, max_gap_ns, source={"task": task_name, "run": run}, crops=vpp_crops)
+                                 vpp_val_every, max_gap_ns, source={"task": task_name, "run": run}, crops=vpp_crops,
+                                 steps=done.info["steps"], step_ends=done.info["step_end_host_mono_ns"])
                 where = ann["videos"][0]["video_path"].split("/")[1]
-                console.say(f"  VPP: {done.name} exported ({where} {ann['episode_id']}, {ann['video_length']} steps)")
+                console.say(f"  VPP: {done.name} exported ({where} {ann['episode_id']}, {ann['video_length']} frames"
+                            + (f", {len(ann['segments'])} segments" if "segments" in ann else "") + ")")
             except Exception as exc:  # the episode itself is saved; python vpp.py <task> exports it again
                 console.say(f"✗ VPP export of {done.name} failed: {exc!r}")
         exports[done.name] = threading.Thread(target=work, daemon=True)
@@ -454,16 +552,52 @@ def main():
     pending = []  # (episode, reason, close at monotonic ns): wait for the robot records after the last frame
     resets, homing = 0, None  # reset requests sent; monotonic ns of the one the robot is still homing for
 
+    def reset_robot():
+        """The episode start state for the next one: gripper open, then moveJ home; Next once the robot reports it."""
+        nonlocal resets, homing
+        resets, homing = resets + 1, time.monotonic_ns()
+        node.send_output("reset", pa.array([json.dumps({"id": resets})]))
+        console.say("  Reset for the next episode: opening the gripper, returning home ...")
+
     def close(done, reason):
         """Save a stopped episode, then (HOME_AFTER_EPISODE=1) send the robot home for the next one."""
-        nonlocal resets, homing
         finish(done, reason)
         if home_after:
-            resets, homing = resets + 1, time.monotonic_ns()
-            node.send_output("reset", pa.array([json.dumps({"id": resets})]))
-            console.say("  Reset for the next episode: opening the gripper, returning home ...")
+            reset_robot()
         else:
             say_next()
+
+    def fail_episode(roles, now):
+        """A camera stopped during the episode: delete it (its number is free again) and reset the robot."""
+        nonlocal count
+        done = stop()
+        done.discard()
+        meta["episodes"].remove(done.name)
+        save_meta()
+        count = last_episode(task)[0]
+        console.say(f"✗ {'/'.join(roles)} camera: no frame for {camera_fail_s:g} s, {done.name} deleted "
+                    "(the camera is being restarted)")
+        beat(now)
+        reset_robot()  # also with HOME_AFTER_EPISODE=0: the arm stopped mid-task
+
+    down = {}  # camera role -> monotonic ns since when it delivers no frames (it had delivered, or it failed)
+
+    def watch_cameras(now):
+        """Every tick: a camera without frames fails the episode being recorded; a camera back is reported; one
+        still down after CAMERA_GIVE_UP_S ends the run, once the robot is home."""
+        for c in cams:
+            if c.role in down and now - c.last_ns < 5e8:
+                del down[c.role]
+                console.say(f"  {c.role} camera delivers frames again")
+            elif c.role not in down and now - c.last_ns >= 5e8 and (c.last_ns or c.error is not None):
+                down[c.role] = c.last_ns or now
+        if episode is not None and (failed := [c.role for c in cams if now - c.last_ns >= camera_fail_s * 1e9]):
+            fail_episode(failed, now)
+        lost = [c for c in cams if c.role in down and now - down[c.role] >= give_up_s * 1e9]
+        if lost and (homing is None or now - homing > 60e9):  # moveJ home < 60 s
+            console.say(f"✗ {'/'.join(c.role for c in lost)} camera: no frames for {give_up_s:g} s, it could not be "
+                        "restarted: ending the run (the robot is home)")
+            raise RuntimeError("; ".join(f"{c.role} camera: {c.error!r}" for c in lost))
 
     def beat(now):
         """Heartbeat to the ur5 node while every camera delivers frames; `recording`: the SpaceMouse may move the
@@ -477,6 +611,8 @@ def main():
             return "saving the last episode"
         if not robot_t or homing is not None:
             return "the robot is returning home"
+        if stale := [c.role for c in cams if time.monotonic_ns() - c.last_ns >= 5e8]:
+            return f"the {'/'.join(stale)} camera is not delivering frames"
         return None
 
     def ask_delete():
@@ -514,10 +650,12 @@ def main():
 
     asked = None  # episode directory waiting for y after d
     console.say("Cameras started. The SpaceMouse moves the robot only while recording. Space = start / stop "
-                "recording; d then y = delete the last episode; h = home; Esc = home and quit.")
+                "recording; " + (f"Enter = end of a step ({describe_steps(steps)}), the last one stops; " if steps
+                                 else "") + "d then y = delete the last episode; h = home; Esc = home and quit.")
     console.say(f"Task {task_name}: last episode {describe(last)}" if last else f"Task {task_name}: no episodes yet")
     auto_start = os.getenv("START_RECORDING", "0") == "1"  # tests: as if Space were pressed as soon as it may be
     say_next()
+    stop_all = False
     with (run_dir / "robot.jsonl").open("w", buffering=1) as robot_log:
         try:
             for event in node:
@@ -546,6 +684,13 @@ def main():
                     else:
                         start()
                     beat(now)  # the SpaceMouse takes / loses the robot now, not at the next tick
+                elif event["id"] == "step":  # keyboard: Enter, value = the time it read the key
+                    if episode is None:
+                        console.say("  Enter ends a step only while recording (Space starts an episode)")
+                    elif not steps:
+                        console.say(f"  Task {task_name} has no steps: Space stops the episode")
+                    else:
+                        end_step(int(event["value"][0].as_py()), now)
                 elif event["id"] == "delete":  # keyboard: d -> "ask"; the next key -> "yes" (y) or "no" (any other)
                     answer, last_status = event["value"][0].as_py(), 0  # show / clear the question at the next tick
                     if answer == "ask":
@@ -557,9 +702,7 @@ def main():
                             console.say(f"  Kept {asked.name}")
                         asked = None
                 elif event["id"] == "tick":
-                    for c in cams:
-                        if c.error is not None:
-                            raise RuntimeError(f"{c.role} camera: {c.error}")
+                    watch_cameras(now)
                     if not robot_t and now - meta["start_host_mono_ns"] > 60e9:  # homing (countdown + moveJ) < 60 s
                         raise RuntimeError("No robot state within 60 s: the ur5 node is not running (see the ur5 errors in the log)")
                     if auto_start and episode is None and not busy():
@@ -582,16 +725,17 @@ def main():
                             robot = ""
                         warn = "; ".join(filter(None, [f"{'/'.join(stale)} camera not delivering frames, robot locked" if stale else "", robot]))
                         if episode is not None:
-                            s = (now - episode.info["start_host_mono_ns"]) / 1e9
-                            console.status(f"● Recording {episode.name}  {int(s // 60):02d}:{int(s % 60):02d}"
+                            k = len(episode.info["step_end_host_mono_ns"])
+                            console.status(f"● Recording {episode.name}  {clock(now)}"
+                                           + (f"  step {k + 1}/{len(steps)} {steps[k]}" if steps else "")
                                            + (f"  ⚠ {warn}" if warn else ""))
                         else:
                             ask = f"Delete {asked.name}? y = delete, any other key = keep" if asked else ""
                             console.status("  ".join(filter(None, [ask, f"⚠ {warn}" if warn else ""]))
                                            or "Ready: press Space to start recording (the robot follows the "
                                               "SpaceMouse only while recording)")
-        except BaseException:
-            end_reason = "error"
+        except BaseException as exc:
+            end_reason, stop_all = "error", isinstance(exc, Exception)  # not on Ctrl-C: dora is stopping already
             raise
         finally:
             if episode is not None:
@@ -607,6 +751,8 @@ def main():
             meta["end_host_mono_ns"] = time.monotonic_ns()
             save_meta()
             console.say(f"Exited. Recorded {len(meta['episodes'])} episode(s) this run, task {task_name} in {task}")
+            if stop_all:  # else the other nodes keep `dora run` going (the ur5 node ends with its inputs,
+                os.kill(os.getppid(), signal.SIGINT)  # without homing); parent = `dora run`: stops them all
 
 
 if __name__ == "__main__":

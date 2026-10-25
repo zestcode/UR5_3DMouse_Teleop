@@ -373,5 +373,80 @@ class ControlTests(unittest.TestCase):
         self.assertIn("min [0.35, 0.35, 0.45] max [0.65, 0.65, 0.65]", workspace)
 
 
+def heartbeat(recording):
+    return {"type": "INPUT", "id": "heartbeat", "payload": {"t_ns": time.monotonic_ns(), "recording": recording}}
+
+
+def waypoints(x, close, plan_id=1):
+    """A chunk whose target is x (the fake robot stays at .5) from 1 s ago to 10 s ahead, gripper `close`."""
+    now = time.monotonic_ns()
+    return {"type": "INPUT", "id": "waypoints", "payload": {
+        "id": plan_id, "t_ns": [now - 10**9, now + 10**10], "poses": [[x, .5, .5, 1, 0, 0, 0, 1, 0]] * 2,
+        "gripper": [close] * 2}}
+
+
+class PolicyControlTests(unittest.TestCase):
+    """CONTROL=policy (deploy.yml): the target follows the policy node's timed waypoints. Fake RTDE, no network;
+    each None is one controller cycle (8 ms of controller time)."""
+
+    def run_policy(self, events):
+        control, receive = MagicMock(), MagicMock()
+        receive.getRobotMode.return_value, receive.getSafetyMode.return_value = 7, 1
+        receive.getActualTCPPose.return_value = [.5, .5, .5, 0., 0., 0.]  # the fake robot never moves
+        receive.getActualTCPSpeed.return_value = [0.] * 6
+        stamps, last = (1 + .008 * i for i in itertools.count()), [None]
+        receive.getTimestamp.side_effect = lambda: last.__setitem__(0, next(stamps)) or last[0]
+        control.servoL.return_value = True
+        control.getTCPOffset.return_value = [0.] * 6
+        events = iter([*events, {"type": "STOP"}])
+        node = MagicMock()
+        node.next.side_effect = lambda **kw: next(events, None)
+        gripper = MagicMock(error=None)
+        gripper.snapshot.return_value = {"mode": "stopped", "pos": 0, "obj": 3, "t_ns": 1}
+        spec = importlib.util.spec_from_file_location("tested_ur5", Path(__file__).resolve().parents[1] / "ur5.py")
+        module = importlib.util.module_from_spec(spec)
+        modules = {"dora": types.SimpleNamespace(Node=lambda: node),
+                   "rtde_control": types.SimpleNamespace(RTDEControlInterface=lambda *a: control),
+                   "rtde_receive": types.SimpleNamespace(RTDEReceiveInterface=lambda *a: receive)}
+        env = {"DRY_RUN": "0", "ROBOT_IP": "fake", "CONTROL": "policy", "WORKSPACE_MIN": "[0,0,0]",
+               "WORKSPACE_MAX": "[1,1,1]", "GRIPPER": "1", "HOME_Q_DEG": "", "MAX_LINEAR_M_S": "0.08"}
+        printed = MagicMock()
+        with patch.dict(sys.modules, modules), patch.dict("os.environ", env):
+            spec.loader.exec_module(module)
+            with patch.object(module, "send_json") as sent, patch.object(module, "read_json", lambda e: e["payload"]), \
+                    patch.object(module, "print", printed, create=True), \
+                    patch.object(module, "Gripper", lambda *a, **k: gripper):
+                module.main()
+        self.servo_x = np.array([c.args[0][0] for c in control.servoL.call_args_list])
+        self.states = [c.args[2] for c in sent.call_args_list if c.args[1] == "state"]
+        self.presses = [(*c.args, c.kwargs.get("toggle")) for c in gripper.press.call_args_list]
+        return [c.args[0] for c in printed.call_args_list]
+
+    def test_target_follows_the_chunk_at_the_speed_limit(self):
+        lines = self.run_policy([heartbeat(True), waypoints(.6, 1), *[None] * 30])
+        steps = np.diff([.5, *self.servo_x])
+        self.assertEqual(len(steps), 30)  # the first None ends the cycle that read the heartbeat and the chunk
+        np.testing.assert_allclose(steps, .08 * .008, rtol=1e-6)  # 10 cm away: MAX_LINEAR_M_S x one cycle each
+        self.assertEqual(self.presses, [("close", False)])  # once, not every cycle; no toggle (a 2nd press stops)
+        self.assertEqual({s["plan_id"] for s in self.states}, {1})
+        self.assertTrue(any(line.startswith("REAL policy plan=1") for line in lines))
+
+    def test_pause_drops_the_chunk_and_holds(self):
+        self.run_policy([heartbeat(True), waypoints(.6, 0), *[None] * 10, heartbeat(False), *[None] * 10,
+                         heartbeat(True), *[None] * 10])
+        moved = np.diff([.5, *self.servo_x]) > 0
+        self.assertEqual(moved.tolist(), [True] * 10 + [False] * (len(moved) - 10))  # never resumes the old chunk
+        self.assertEqual([s["plan_id"] for s in self.states][-1], None)
+        self.assertEqual(self.presses, [("open", False)])
+
+    def test_gripper_follows_the_chunk_when_it_changes(self):
+        self.run_policy([heartbeat(True), waypoints(.6, 1, 1), *[None] * 5, waypoints(.6, 1, 2), *[None] * 5,
+                         waypoints(.6, 0, 3), *[None] * 5])
+        self.assertEqual(self.presses, [("close", False), ("open", False)])  # chunk 2 changes nothing
+        events = [e for s in self.states for e in s["gripper"]["events"]]
+        self.assertEqual(events, ["close", "open"])  # logged in the state record of that cycle
+        self.assertEqual([s["plan_id"] for s in self.states][-1], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

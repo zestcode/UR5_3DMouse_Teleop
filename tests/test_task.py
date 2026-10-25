@@ -1,5 +1,6 @@
-"""UNIT tests of task.py (the start-up task question) on its own: name cleaning, the task list, and the questions
-(task, then its instruction), answered through a pseudo-terminal (no dora, no robot, no cameras)."""
+"""UNIT tests of task.py (the start-up task question) on its own: name cleaning, the task list, step verbs, and the
+questions (task, then its instruction, then with --steps its steps), answered through a pseudo-terminal (no dora, no
+robot, no cameras)."""
 import json
 import os
 from pathlib import Path
@@ -44,11 +45,34 @@ class TestNames(unittest.TestCase):
             self.assertEqual(t.tasks(root), [("new", 0, None), ("old", 3, "010_episode")])
 
 
+class TestSteps(unittest.TestCase):
+    def test_parse_steps(self):
+        self.assertEqual(t.parse_steps("open pick place close"), ["open", "pick", "place", "close"])
+        self.assertEqual(t.parse_steps(" Open, PICK -> place "), ["open", "pick", "place"])  # as the summary shows them
+        self.assertEqual(t.parse_steps("  "), [])
+
+    def test_a_step_is_one_word_of_letters(self):
+        for text in ("pick2", "pick_up", "pick-up", "放"):
+            with self.assertRaises(ValueError, msg=text):
+                t.parse_steps(text)
+
+    def test_read_steps_tells_never_asked_from_no_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = Path(tmp)
+            self.assertIsNone(t.read_steps(task / "missing"))
+            (task / "task.json").write_text(json.dumps({"instruction": "x"}))
+            self.assertIsNone(t.read_steps(task))  # a task from before steps existed: ask
+            (task / "task.json").write_text(json.dumps({"instruction": "x", "steps": []}))
+            self.assertEqual(t.read_steps(task), [])  # answered: no steps
+            (task / "task.json").write_text(json.dumps({"instruction": "x", "steps": ["open", "pick"]}))
+            self.assertEqual(t.read_steps(task), ["open", "pick"])
+
+
 class TestQuestions(unittest.TestCase):
-    def ask(self, root, env_extra=None):
-        env = {k: v for k, v in os.environ.items() if k != "TASK"}
-        return PtyProcess([sys.executable, str(HERE / "task.py")], {**env, "OUT_DIR": str(root), **(env_extra or {})},
-                          stdout=subprocess.PIPE)
+    def ask(self, root, env_extra=None, args=()):
+        env = {k: v for k, v in os.environ.items() if k not in ("TASK", "STEPS")}
+        return PtyProcess([sys.executable, str(HERE / "task.py"), *args],
+                          {**env, "OUT_DIR": str(root), **(env_extra or {})}, stdout=subprocess.PIPE)
 
     def result(self, p, instruction=None):
         """-> (exit status, stdout: task name and instruction); instruction: typed at its question first."""
@@ -130,9 +154,73 @@ class TestQuestions(unittest.TestCase):
             p.key(b"e")
             self.assertEqual(self.result(p), (0, "pick\nlift the cup"))
 
+    def test_new_task_asks_its_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self.ask(Path(tmp), args=["--steps"])
+            p.wait_for("Name of the new task: ")
+            p.key(b"drawer\n")
+            p.wait_for("Instruction for this task")
+            p.key(b"put the cup in the drawer\n")
+            at = p.wait_for("Steps of this task, verbs in order (e.g. open pick place close; Enter = no steps): ")
+            p.key(b"open pick2\n")
+            at = p.wait_for("pick2", at)  # refused: asked again
+            at = p.wait_for("Steps of this task", at)
+            p.key(b"Open pick push close\n")
+            at = p.wait_for("push", at)  # a verb AtomicVPP does not know: a warning, still taken
+            p.wait_for("4 steps: open -> pick -> push -> close", at)
+            self.assertEqual(self.result(p), (0, "drawer\nput the cup in the drawer\nopen pick push close"))
+
+    def test_enter_at_the_steps_question_means_no_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self.ask(Path(tmp), args=["--steps"])
+            p.wait_for("Name of the new task: ")
+            p.key(b"pick\n")
+            p.wait_for("Instruction for this task")
+            p.key(b"\n")
+            p.wait_for("Steps of this task")
+            p.key(b"\n")
+            p.wait_for("no steps")
+            self.assertEqual(self.result(p), (0, "pick\npick"))  # the empty third line
+
+    def test_steps_of_task_json_are_not_asked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            make_tasks(Path(tmp), {"pick": ["001_episode"]})
+            for steps, shown, out in ((["open", "pick"], "Steps: open -> pick", "open pick"), ([], "Steps: none", "")):
+                (Path(tmp) / "pick" / "task.json").write_text(json.dumps({"instruction": "x", "steps": steps}))
+                p = self.ask(Path(tmp), args=["--steps"])
+                p.wait_for("e = continue")
+                p.key(b"e")
+                p.wait_for(shown)
+                self.assertEqual(self.result(p), (0, f"pick\nx\n{out}".strip()))
+
+    def test_existing_task_without_steps_is_asked_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            make_tasks(Path(tmp), {"pick": ["001_episode"]})
+            (Path(tmp) / "pick" / "task.json").write_text(json.dumps({"instruction": "x"}))  # before steps existed
+            p = self.ask(Path(tmp), args=["--steps"])
+            p.wait_for("e = continue")
+            p.key(b"e")
+            p.wait_for("Steps of this task")
+            p.key(b"pick place\n")
+            self.assertEqual(self.result(p), (0, "pick\nx\npick place"))
+            p = self.ask(Path(tmp), {"STEPS": "turn"}, args=["--steps"])  # STEPS: no question either
+            p.wait_for("e = continue")
+            p.key(b"e")
+            self.assertEqual(self.result(p), (0, "pick\nx\nturn"))
+
+    def test_without_steps_option_no_steps_question(self):
+        with tempfile.TemporaryDirectory() as tmp:  # deploy.sh: two lines, as before steps existed
+            make_tasks(Path(tmp), {"pick": ["001_episode"]})
+            (Path(tmp) / "pick" / "task.json").write_text(json.dumps({"instruction": "x", "steps": ["pick"]}))
+            p = self.ask(Path(tmp))
+            p.wait_for("e = continue")
+            p.key(b"e")
+            self.assertEqual(self.result(p), (0, "pick\nx"))
+            self.assertNotIn(b"Steps", p.out)
+
     def test_task_env_skips_the_questions_and_no_terminal_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
-            env = {k: v for k, v in os.environ.items() if k != "INSTRUCTION"}
+            env = {k: v for k, v in os.environ.items() if k not in ("INSTRUCTION", "STEPS")}
             env = {**env, "OUT_DIR": tmp, "TASK": "my task"}
             run = lambda env: subprocess.run([sys.executable, str(HERE / "task.py")], env=env, stdin=subprocess.DEVNULL,
                                              capture_output=True, text=True, timeout=10)
@@ -142,6 +230,15 @@ class TestQuestions(unittest.TestCase):
             (Path(tmp) / "my_task" / "task.json").write_text(json.dumps({"instruction": "do it"}))
             self.assertEqual(run(env).stdout.strip(), "my_task\ndo it")
             self.assertEqual(run({**env, "INSTRUCTION": "do that"}).stdout.strip(), "my_task\ndo that")
+            steps = lambda env: subprocess.run([sys.executable, str(HERE / "task.py"), "--steps"], env=env,
+                                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+            self.assertEqual(steps(env).stdout, "my_task\ndo it\n\n")  # no steps known: none, not asked
+            self.assertEqual(steps({**env, "STEPS": "Pick, place"}).stdout, "my_task\ndo it\npick place\n")
+            (Path(tmp) / "my_task" / "task.json").write_text(json.dumps({"instruction": "do it", "steps": ["turn"]}))
+            self.assertEqual(steps(env).stdout, "my_task\ndo it\nturn\n")
+            out = steps({**env, "STEPS": "pick2"})
+            self.assertNotEqual(out.returncode, 0)
+            self.assertIn("STEPS", out.stderr)
             env.pop("TASK")
             out = subprocess.run([sys.executable, str(HERE / "task.py")], env=env, stdin=subprocess.DEVNULL,
                                  capture_output=True, text=True, timeout=10)
